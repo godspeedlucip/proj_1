@@ -1,0 +1,3 @@
+# 合成数据格式
+
+`make_synthetic_dataset(out_dir, seed)` writes six 64×64 grayscale TIFF projections per group, matching binary mask TIFFs, and a UTF-8 `manifest.json`. Each case has exactly three views with `view_id`, `angle_deg`, `projection_path`, `mask_path`, two floating point `marker_xy` coordinates in original `(x=column,y=row)` pixels, and a finite 3×4 projection matrix `P`. Difficulty cycles through `normal`, `close`, and `low_disparity`. `folds.fold_0` is group-wise: four train groups, one validation group, and one test group. Masks are metadata for downstream use; Phase 1 training reads only projection pixels and marker coordinates.
