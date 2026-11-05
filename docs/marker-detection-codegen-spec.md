@@ -1,5 +1,7 @@
 # Phase 1：三视角双 Marker 检测系统 Spec（任务优先版）
 
+本文件描述当前已实现的单投影热图检测与候选级三视角融合基线。下一版的三图联合训练与检测见[固定间隔锥束投影三视角联合检测 Spec](three-view-joint-marker-detection-spec.md)及其[实施方案](three-view-joint-marker-detection-implementation-plan.md)；病例清单与 Phase 2 二维点对交接继续沿用本文和交接契约。
+
 首版实施步骤见 [Phase 1 Plan](marker-detection-implementation-plan.md)，跨阶段数据定义见[交接契约](../../docs/phase1-phase2-handoff-design.md)。
 
 ## 1. 任务目标与方案选择

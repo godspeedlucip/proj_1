@@ -38,7 +38,7 @@ def main(argv=None):
         ckpt=torch.load(args.checkpoint,map_location="cpu",weights_only=False); cfg={**ckpt.get("config",{}),**cfg}
         mid=_model_id(args.checkpoint,cfg)
         for case in cases:
-            rec=_predict_case(case,args.checkpoint,cfg,mid,"held_out","inference")
+            rec=_predict_case(case,args.checkpoint,cfg,mid,"held_out","inference",out/"diagnostics")
             (out/f"{case.case_id}.json").write_text(json.dumps(rec,indent=2),encoding="utf-8")
         print(json.dumps({"prediction_count":len(cases),"out_dir":str(out)},indent=2)); return 0
     if args.command=="evaluate":

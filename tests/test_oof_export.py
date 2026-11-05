@@ -42,3 +42,33 @@ def test_unordered_evaluation_is_permutation_invariant():
     a=np.array([[2.2,3.],[9.8,11.]])
     b=a[::-1]
     assert evaluate._pair_metrics(truth,a,3)==evaluate._pair_metrics(truth,b,3)
+
+
+def test_unordered_evaluation_requires_one_to_one_pair_matching():
+    truth=np.array([[0.,0.],[0.2,0.]])
+    one_distant_prediction=np.array([[0.,0.],[10.,0.]])
+    error,ok=evaluate._pair_metrics(truth,one_distant_prediction,1.0)
+    assert not ok
+    assert error > 4.0
+    assert evaluate._pair_metrics(truth[::-1],one_distant_prediction,1.0)==(error,ok)
+
+
+def test_invalid_view_counts_as_failure_in_primary_pair_accuracy(tmp_path):
+    from phase_1.tests.test_joint_pipeline import make_case
+    case=make_case("c","g",0)
+    views=[]
+    for index,view in enumerate(case.views):
+        views.append({"view_id":view.view_id,"image_size":[32,32],
+                      "marker_xy":None if index==2 else view.marker_xy.tolist(),
+                      "error_radius_px":None if index==2 else [1.,1.],
+                      "q_pair":0 if index==2 else None,
+                      "pair_status":"invalid" if index==2 else "reliable",
+                      "fusion_mode":None if index==2 else "three_view"})
+    record={"schema_version":"phase1_marker_case_v1","case_id":"c","group_id":"g",
+            "model_id":"m","geometry_id":"fixed_cone","calibration_id":None,
+            "prediction_source":"held_out","fold_id":"fold0","views":views}
+    (tmp_path/"c.json").write_text(json.dumps(record),encoding="utf-8")
+    result=evaluate([case],tmp_path,tau=1.0)
+    assert result["PairAcc@tau"]==2/3
+    assert result["conditional_PairAcc@tau"]==1.0
+    assert result["three_view_all_success_rate"]==0.0
