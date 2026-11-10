@@ -1,0 +1,65 @@
+{
+  "schema_version": "fdk_unet_experiment_v3",
+  "spec_version": "fdk_unet_swin_fusion_spec_v3",
+  "experiment_id": "A",
+  "core_experiment_id": "A",
+  "run_kind": "formal",
+  "seed": 2026,
+  "model_id": "plain_fdk_unet3d_v1",
+  "stage": "baseline",
+  "input_adapter": false,
+  "unet": {
+    "channels": [
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "norm": "batch",
+    "out_channels": 1
+  },
+  "prior": null,
+  "fusion": null,
+  "swin_input": {
+    "mode": "train_percentile",
+    "percentiles": [
+      0.5,
+      99.5
+    ],
+    "samples_per_group": 65536
+  },
+  "patch_size": [
+    128,
+    128,
+    128
+  ],
+  "batch_size": 2,
+  "optimizer": {
+    "name": "Adam",
+    "lr": 0.001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.0
+  },
+  "loss": "foreground_dice_bce",
+  "max_optimizer_steps": 10000,
+  "validate_every": 250,
+  "foreground_probability": 0.33,
+  "augment": true,
+  "threshold": 0.5,
+  "num_workers": 0,
+  "amp": "cuda_float16",
+  "scheduler": null,
+  "tta": false,
+  "postprocessing": null,
+  "checkpoint_selection": "validation_group_dice",
+  "inference_stride": [
+    64,
+    64,
+    64
+  ]
+}
