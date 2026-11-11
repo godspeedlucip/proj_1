@@ -1,0 +1,25 @@
+{
+  "schema_version": "phase3_nnunet_upstream_v1",
+  "checked_date": "2026-11-11",
+  "repository": "https://github.com/MIC-DKFZ/nnUNet",
+  "selection": "latest_stable_release",
+  "tag": "v2.8.1",
+  "commit": "468cf803df9b267150ae2b6c0c59b8ac84f16227",
+  "archive_url": "https://codeload.github.com/MIC-DKFZ/nnUNet/zip/468cf803df9b267150ae2b6c0c59b8ac84f16227",
+  "archive_sha256": "e1a0d1df341c4ca19adf18a135816a30808821096c9bc308a480d4d19bdaba55",
+  "upstream_source_modified": false,
+  "implementation_status": "synthetic_software_verified",
+  "reference_root": "D:/desktop/课题1/nnUNet",
+  "requested_extensions": [
+    "Swin UNETR encoder fusion",
+    "TubularEnhancement",
+    "projection consistency loss"
+  ],
+  "verified_upstream_file_count": 281,
+  "upstream_archive_file_hash_mismatches": 0,
+  "custom_extension_root": "phase_3/nnunet/nnunetv2/phase3",
+  "local_nnunetv2_python_file_count": 223,
+  "local_nnunetv2_python_source_sha256": "2b20b943258aaf8ec5f1600bb03ca10035e6ef41c4cd1569d96654064afc2aad",
+  "local_source_digest_algorithm": "sha256 of sorted relative POSIX path, NUL, raw-file sha256 bytes for each nnunetv2/*.py",
+  "local_source_digest_scope": "includes upstream Python files plus Phase 3 extension modules; excludes tests, configs and docs"
+}
