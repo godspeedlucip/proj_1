@@ -1,0 +1,126 @@
+schema_version: 2
+method: B
+profile: B-original-3view
+seed: 42
+geometry:
+  sdd_mm: 1100
+  sid_mm: 600
+  pixel_size_mm: 0.3
+  detector_shape:
+  - 1024
+  - 1024
+  angles_deg:
+  - 0
+  - 60
+  - 120
+  calibration_id: null
+  grid:
+    shape:
+    - 256
+    - 256
+    - 256
+    spacing_mm:
+    - 0.6
+    - 0.6
+    - 0.6
+    origin_mm:
+    - -76.5
+    - -76.5
+    - -76.5
+    direction:
+    - - 1
+      - 0
+      - 0
+    - - 0
+      - 1
+      - 0
+    - - 0
+      - 0
+      - 1
+network:
+  architecture: paper
+  slice_channels: 5
+  input_channels: 3
+  bn_eps: 1.0e-05
+  bn_momentum: 0.1
+  conv_bias: true
+  initialization: he_normal
+  dte_activation: relu
+  dtr_activation: sigmoid
+  dice_smoothing: 1.0
+  compact_base: 4
+training:
+  dte:
+    epochs: 200
+    batch_size: 24
+    learning_rate: 1.0e-05
+    train_pairs: 16000
+    validation_pairs: 4000
+    patch_shape:
+    - 384
+    - 384
+    normalization: none
+    precision: amp_float16
+    activation_checkpointing: true
+    selection_metric: mae
+  dtr:
+    epochs: 150
+    batch_size: 8
+    learning_rate: 0.0001
+    train_pairs: 16000
+    validation_pairs: 4000
+    patch_shape:
+    - 128
+    - 128
+    - 128
+    normalization: none
+    precision: amp_float16
+    activation_checkpointing: true
+    selection_metric: dice
+preprocessing:
+  attenuation_per_mm: 0.1
+  integration_step_mm: 0.5
+  photons_range:
+  - 10000
+  - 100000
+  blur_sigma_px: 1.4
+  scatter_range:
+  - 0.0
+  - 0.0
+  min_background: 0.01
+  false_negative_rate: 0.05
+  false_positive_rate: 0.001
+  false_positive_scale: 0.2
+  dtr_crop_shape: null
+  spectral: null
+  error_model: independent_pixel
+  correlation_sigma_px: 2.0
+simulation:
+  angular_offset_mode: fixed
+  start_angle_range_deg:
+  - 0
+  - 180
+  dte_views: same
+  material_density_range_g_cm3: null
+inference:
+  threshold: 0.5
+  slice_batch: 1
+  max_volume_voxels: 16777216
+  retain_intermediates: true
+  tiling:
+    enabled: false
+    dte_shape: null
+    dtr_shape: null
+    overlap_fraction: 0.25
+evaluation:
+  allow_empty_truth: false
+provenance:
+  purpose: reference
+  dataset_version: REPLACE_WITH_FROZEN_DATA_VERSION
+  geometry_calibrated: false
+  author_data: false
+  notes:
+  - Example geometry; verify actual system and complete field of view before formal
+    experiments.
+  - CUDA execution mode verified on RTX4070Ti SUPER; identical channels/batch/patch
+    with AMP and BN-safe activation checkpointing; not numerical author equivalence

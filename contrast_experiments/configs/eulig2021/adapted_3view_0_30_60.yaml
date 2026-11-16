@@ -1,0 +1,32 @@
+profile: A-adapted-3view
+angles_deg:
+- 0
+- 30
+- 60
+geometry:
+  sdd_mm: 1200
+  sid_mm: 785
+  detector_pixels:
+  - 1240
+  - 960
+  pixel_size_mm: 0.308
+  voxel_spacing_mm: 0.1
+training:
+  dte:
+    batch_size: 6
+    learning_rate: 0.0001
+    epochs: null
+  dtr:
+    batch_size: 16
+    learning_rate: 0.0001
+    slice_channels:
+    - 1
+    - 3
+    - 5
+provenance:
+  spectrum: unknown
+  filter: implementation decision pending
+  base_models: missing
+  patient_scans: missing
+  dtr_training_projection: ideal noiseless tool only
+seed: 42

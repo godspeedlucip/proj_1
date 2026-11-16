@@ -1,0 +1,143 @@
+schema_version: 2
+method: A
+profile: A-adapted-3view
+seed: 42
+geometry:
+  sdd_mm: 200
+  sid_mm: 100
+  pixel_size_mm: 2
+  detector_shape:
+  - 16
+  - 16
+  angles_deg:
+  - 0
+  - 30
+  - 60
+  calibration_id: null
+  grid:
+    shape:
+    - 16
+    - 16
+    - 16
+    spacing_mm:
+    - 1
+    - 1
+    - 1
+    origin_mm:
+    - -7.5
+    - -7.5
+    - -7.5
+    direction:
+    - - 1
+      - 0
+      - 0
+    - - 0
+      - 1
+      - 0
+    - - 0
+      - 0
+      - 1
+network:
+  architecture: compact-g0
+  slice_channels: 5
+  input_channels: 3
+  bn_eps: 1.0e-05
+  bn_momentum: 0.1
+  conv_bias: true
+  initialization: he_normal
+  dte_activation: relu
+  dtr_activation: sigmoid
+  dice_smoothing: 1.0
+  compact_base: 4
+training:
+  dte:
+    epochs: 2
+    batch_size: 2
+    learning_rate: 0.0001
+    train_pairs: 8
+    validation_pairs: 4
+    patch_shape:
+    - 16
+    - 16
+    normalization: running
+    precision: float32
+    activation_checkpointing: false
+    selection_metric: mae
+  dtr:
+    epochs: 2
+    batch_size: 2
+    learning_rate: 0.0001
+    train_pairs: 8
+    validation_pairs: 4
+    patch_shape:
+    - 16
+    - 16
+    normalization: volume
+    precision: float32
+    activation_checkpointing: false
+    selection_metric: dice
+preprocessing:
+  attenuation_per_mm: 0.1
+  integration_step_mm: 0.5
+  photons_range:
+  - 10000
+  - 100000
+  blur_sigma_px: 0.3
+  scatter_range:
+  - 0.0
+  - 0.0
+  min_background: 0.01
+  false_negative_rate: 0.05
+  false_positive_rate: 0.001
+  false_positive_scale: 0.2
+  dtr_crop_shape: null
+  spectral:
+    energy_kev:
+    - 60
+    - 80
+    spectrum_weights:
+    - 1
+    - 1
+    detector_response:
+    - 1
+    - 1
+    spectrum_source: project two-bin analytic validation fixture, not a measured tube
+      spectrum
+    detector_response_source: project ideal flat response fixture
+    materials:
+      tool:
+        density_g_cm3: 3.5
+        density_source: project fixed validation density within A reported interval
+        mass_attenuation_cm2_g:
+        - 1.205
+        - 0.5952
+        attenuation_source: https://physics.nist.gov/PhysRefData/XrayMassCoef/ElemTab/z26.html
+  error_model: independent_pixel
+  correlation_sigma_px: 2.0
+simulation:
+  angular_offset_mode: fixed
+  start_angle_range_deg:
+  - 0
+  - 180
+  dte_views: same
+  material_density_range_g_cm3: null
+inference:
+  threshold: 0.5
+  slice_batch: 1
+  max_volume_voxels: 16777216
+  retain_intermediates: true
+  tiling:
+    enabled: false
+    dte_shape: null
+    dtr_shape: null
+    overlap_fraction: 0.25
+evaluation:
+  allow_empty_truth: false
+provenance:
+  purpose: g0
+  dataset_version: synthetic-g0-v1
+  geometry_calibrated: false
+  author_data: false
+  notes:
+  - Example geometry; verify actual system and complete field of view before formal
+    experiments.

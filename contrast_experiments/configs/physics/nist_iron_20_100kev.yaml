@@ -1,0 +1,9 @@
+# Elemental Fe. The energy grid is in keV; NIST Table 3 publishes MeV.
+# Supply incident spectrum and detector response separately on the same grid.
+energy_kev: [20, 30, 40, 50, 60, 80, 100]
+materials:
+  tool:
+    density_g_cm3: 7.874
+    density_source: https://physics.nist.gov/PhysRefData/XrayMassCoef/tab1.html
+    mass_attenuation_cm2_g: [25.68, 8.176, 3.629, 1.958, 1.205, 0.5952, 0.3717]
+    attenuation_source: https://physics.nist.gov/PhysRefData/XrayMassCoef/ElemTab/z26.html

@@ -1,0 +1,36 @@
+profile: B-original-3view
+angles_deg:
+- 0
+- 60
+- 120
+geometry:
+  sdd_mm: 1100
+  sid_mm: 600
+  detector_pixels:
+  - 1024
+  - 1024
+  pixel_size_mm: 0.3
+  grid_shape:
+  - 256
+  - 256
+  - 256
+  voxel_spacing_mm: 0.6
+training:
+  dte:
+    batch_size: 24
+    learning_rate: 1.0e-05
+    epochs: 200
+    train_pairs: 16000
+    validation_pairs: 4000
+  dtr:
+    batch_size: 8
+    learning_rate: 0.0001
+    epochs: 150
+    train_pairs: 16000
+    validation_pairs: 4000
+provenance:
+  patient_projections: missing
+  original_models: missing
+  dtr_training_projection: simulated DTE false positives and negatives
+  framework: PyTorch port; paper used TensorFlow 2.5
+seed: 42

@@ -1,0 +1,105 @@
+schema_version: 2
+method: B
+profile: B-adapted-3view
+seed: 42
+geometry:
+  calibration_id: null
+  sdd_mm: 200
+  sid_mm: 100
+  pixel_size_mm: 2
+  detector_shape:
+  - 16
+  - 16
+  angles_deg:
+  - 0
+  - 30
+  - 60
+  grid:
+    shape:
+    - 16
+    - 16
+    - 16
+    spacing_mm:
+    - 1
+    - 1
+    - 1
+    origin_mm:
+    - -7.5
+    - -7.5
+    - -7.5
+    direction:
+    - - 1
+      - 0
+      - 0
+    - - 0
+      - 1
+      - 0
+    - - 0
+      - 0
+      - 1
+network:
+  architecture: compact-g0
+  slice_channels: 5
+  input_channels: 3
+  bn_eps: 1.0e-05
+  bn_momentum: 0.1
+  conv_bias: true
+  initialization: he_normal
+  dte_activation: relu
+  dtr_activation: sigmoid
+  dice_smoothing: 1.0
+  compact_base: 4
+training:
+  dte:
+    epochs: 2
+    batch_size: 2
+    learning_rate: 1.0e-05
+    train_pairs: 8
+    validation_pairs: 4
+    patch_shape:
+    - 16
+    - 16
+    normalization: none
+    selection_metric: mae
+  dtr:
+    epochs: 2
+    batch_size: 2
+    learning_rate: 0.0001
+    train_pairs: 8
+    validation_pairs: 4
+    patch_shape:
+    - 16
+    - 16
+    - 16
+    normalization: none
+    selection_metric: dice
+preprocessing:
+  attenuation_per_mm: 0.1
+  integration_step_mm: 0.5
+  photons_range:
+  - 10000
+  - 100000
+  blur_sigma_px: 0.3
+  scatter_range:
+  - 0.0
+  - 0.0
+  min_background: 0.01
+  false_negative_rate: 0.05
+  false_positive_rate: 0.001
+  false_positive_scale: 0.2
+  dtr_crop_shape: null
+inference:
+  threshold: 0.5
+  slice_batch: 1
+  max_volume_voxels: 16777216
+  retain_intermediates: true
+evaluation:
+  allow_empty_truth: false
+provenance:
+  purpose: g0
+  dataset_version: synthetic-g0-v1
+  geometry_calibrated: false
+  author_data: false
+  notes:
+  - Example geometry; verify actual system and complete field of view before formal
+    experiments.
