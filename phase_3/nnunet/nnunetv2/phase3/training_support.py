@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from .data_conversion import PreparedFold
+from .data_conversion import PreparedFold, _file_identity
 from .storage import FDKDatasetBlosc2
 from .dataloading import Phase3DataLoader
 from .transforms import build_transforms
@@ -26,18 +26,26 @@ def load_prepared_for_trainer(trainer, *, verify_files: bool = False) -> Prepare
             or prepared.data_digest != phase3["data_digest"]
             or prepared.split_digest != phase3["split_digest"]
             or prepared.stats_digest != phase3["stats_digest"]
+            or prepared.target_semantics != phase3.get("target_semantics", "stent_struts")
             or not prepared.preprocessed_complete):
         raise ValueError("Prepared fold record differs from Phase 3 plans")
     if verify_files:
+        hash_cache = {}
+        def hash_once(path: Path) -> str:
+            identity = _file_identity(path)
+            if identity not in hash_cache:
+                hash_cache[identity] = file_sha256(path)
+            return hash_cache[identity]
+
         expected_ids = set(prepared.train_ids) | set(prepared.validation_ids)
         if set(prepared.source_cases) != expected_ids:
             raise ValueError("Prepared source hash inventory differs from train/validation split")
         for case_id, row in prepared.source_cases.items():
             for kind in ("image", "label"):
-                if file_sha256(Path(row[kind])) != row[f"{kind}_sha256"]:
+                if hash_once(Path(row[kind])) != row[f"{kind}_sha256"]:
                     raise ValueError(f"Prepared source {kind} hash changed: {case_id}")
         data_dir = Path(trainer.preprocessed_dataset_folder)
-        actual = {path.relative_to(data_dir).as_posix(): file_sha256(path)
+        actual = {path.relative_to(data_dir).as_posix(): hash_once(path)
                   for path in sorted(data_dir.rglob("*")) if path.is_file()}
         if not prepared.preprocessed_file_hashes or actual != prepared.preprocessed_file_hashes:
             raise ValueError("Preprocessed Phase 3 cache hash changed")
@@ -71,7 +79,8 @@ def build_phase3_loaders(trainer):
     dataset_val = FDKDatasetBlosc2(trainer.preprocessed_dataset_folder, val_keys)
     patch = trainer.configuration_manager.patch_size
     common = dict(batch_size=trainer.batch_size, patch_size=patch, final_patch_size=patch,
-                  label_manager=trainer.label_manager, oversample_foreground_percent=.33,
+                  label_manager=trainer.label_manager,
+                  oversample_foreground_percent=trainer.config.training.foreground_probability,
                   sampling_probabilities=None, pad_sides=None, probabilistic_oversampling=True)
     train_loader = Phase3DataLoader(dataset_train, transforms=build_transforms(
         training=True, deep_supervision=trainer.enable_deep_supervision),

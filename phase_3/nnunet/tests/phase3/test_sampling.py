@@ -90,6 +90,39 @@ def test_loader_state_restores_patch_and_keys_after_interleaved_validation(loade
         assert all(torch.equal(a, b) for a, b in zip(left["target"], right["target"]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA checkpoint loading")
+def test_loader_state_restores_after_cuda_checkpoint_load(loader_source, tmp_path):
+    original = _loader(loader_source, 2026)
+    original.generate_train_batch()
+    checkpoint = tmp_path / "loader.pth"
+    torch.save(original.state_dict(), checkpoint)
+    restored_state = torch.load(checkpoint, map_location="cuda:0", weights_only=False)
+    assert restored_state["torch"].device.type == "cuda"
+    expected = original.generate_train_batch()
+
+    resumed = _loader(loader_source, 2026)
+    resumed.load_state_dict(restored_state)
+    actual = resumed.generate_train_batch()
+    assert resumed.state_dict()["torch"].device.type == "cpu"
+    assert actual["keys"] == expected["keys"]
+    assert torch.equal(actual["data"], expected["data"])
+    assert all(torch.equal(a, b) for a, b in zip(actual["target"], expected["target"]))
+
+
+def test_sparse_target_foreground_sampling_uses_label_centers(loader_source):
+    dataset, label_manager, groups = loader_source
+    loader = Phase3DataLoader(dataset, batch_size=1, patch_size=(32, 32, 32),
+                              final_patch_size=(32, 32, 32), label_manager=label_manager,
+                              oversample_foreground_percent=1.0,
+                              transforms=build_transforms(training=False, deep_supervision=False),
+                              case_groups=groups, seed=2026)
+    for _ in range(5):
+        assert bool((loader.generate_train_batch()["target"] == 1).any())
+    original = _loader(loader_source, 2026)
+    with pytest.raises(ValueError, match="identity mismatch"):
+        loader.load_state_dict(original.state_dict())
+
+
 def test_background_only_is_valid_but_all_ignore_is_rejected(loader_source):
     loader = _loader(loader_source, 42, ds=False)
     batch = loader.generate_train_batch()

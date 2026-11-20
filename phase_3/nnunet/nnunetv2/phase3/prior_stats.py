@@ -2,6 +2,7 @@
 from dataclasses import dataclass, asdict
 import numpy as np
 import hashlib
+import nibabel as nib
 
 def seed_for(root_seed: int, scope: str) -> int:
     return int.from_bytes(hashlib.sha256(f"fdk-v3:{root_seed}:{scope}".encode()).digest()[:8], "big") % (2**32)
@@ -41,10 +42,19 @@ def fit_prior_stats(manifest,split,*,seed):
         cases=sorted((c for c in manifest.cases if c.group_id==group),key=lambda c:c.case_id)
         if not cases:raise ValueError('Empty training group')
         choices=rng.integers(len(cases),size=n);values=np.empty(n,np.float32)
+        selected_by_image={}
         for i,c in enumerate(cases):
-            raw=load_volume(c,require_label=False).image_raw.ravel()
             selected=np.flatnonzero(choices==i)
-            values[selected]=raw[rng.integers(raw.size,size=len(selected))]
+            stat=c.image.stat();identity=(stat.st_dev,stat.st_ino)
+            if identity not in selected_by_image:
+                selected_by_image[identity]=[c,int(np.prod(nib.load(str(c.image)).shape)),[]]
+            voxel_count=selected_by_image[identity][1]
+            offsets=rng.integers(voxel_count,size=len(selected))
+            selected_by_image[identity][2].append((selected,offsets))
+        for c,_,selections in selected_by_image.values():
+            raw=load_volume(c,require_label=False).image_raw.ravel()
+            for selected,offsets in selections:
+                values[selected]=raw[offsets]
         samples.append(values)
     lo,hi=np.percentile(np.concatenate(samples),[.5,99.5],method='linear')
     return PriorStats(float(lo),float(hi),seed,'linear',n,n*len(groups),groups,json_digest(list(groups)),

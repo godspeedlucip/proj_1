@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 
-def verify_runtime(expected_root: Path) -> dict:
+def verify_runtime(expected_root: Path, *, require_monai: bool = True) -> dict:
     """Fail early when another installed nnunetv2 shadows this source tree."""
     import nnunetv2
 
@@ -21,7 +21,8 @@ def verify_runtime(expected_root: Path) -> dict:
         raise RuntimeError(f"nnunetv2.paths import root mismatch: {paths_file} is outside {root}")
     import numpy
     import torch
-    import monai
+    if require_monai:
+        import monai
 
     return {
         "python": sys.version.split()[0],
@@ -30,7 +31,7 @@ def verify_runtime(expected_root: Path) -> dict:
         "paths_file": str(paths_file),
         "numpy": numpy.__version__,
         "torch": torch.__version__,
-        "monai": monai.__version__,
+        "monai": monai.__version__ if require_monai else None,
         "cuda_available": torch.cuda.is_available(),
         "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
     }

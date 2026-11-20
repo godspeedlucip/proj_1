@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict, replace
 from pathlib import Path
 import os
 import tempfile
@@ -21,17 +22,44 @@ from .training_support import load_prepared_for_trainer
 CHECKPOINT_SCHEMA = "phase3_checkpoint_v1"
 
 
-def evaluate_validation_group_dice(trainer) -> dict:
+def resolve_saved_log_path(saved_path: Path, output_folder: Path, minimum_bytes: int) -> Path:
+    """Find an epoch log after its model folder has been moved intact."""
+    saved_path = Path(saved_path)
+    output_folder = Path(output_folder)
+    if saved_path.is_file() and saved_path.stat().st_size >= minimum_bytes:
+        return saved_path
+    relocated = output_folder / saved_path.name
+    if (saved_path.parent.name == output_folder.name
+            and saved_path.parent.parent.name == output_folder.parent.name
+            and relocated.is_file() and relocated.stat().st_size >= minimum_bytes):
+        return relocated
+    raise FileNotFoundError(f"Checkpoint log is missing or shorter than saved boundary: {saved_path}")
+
+
+def evaluate_validation_group_dice(trainer, *, on_case=None) -> dict:
     """Predict every validation source at its original physical grid."""
     prepared = load_prepared_for_trainer(trainer)
     state = capture_rng_state()
     benchmark = torch.backends.cudnn.benchmark
     rows = []
+    evaluated = {}
     try:
         for case_id in prepared.validation_ids:
             source = prepared.source_cases.get(case_id)
             if source is None:
                 raise ValueError(f"Original validation source missing: {case_id}")
+            image_stat = Path(source["image"]).stat()
+            label_stat = Path(source["label"]).stat()
+            identity = (image_stat.st_dev, image_stat.st_ino,
+                        label_stat.st_dev, label_stat.st_ino)
+            if identity in evaluated:
+                original_row, image_hash, label_hash = evaluated[identity]
+                if (source["image_sha256"] != image_hash
+                        or source["label_sha256"] != label_hash):
+                    raise ValueError(f"Validation duplicate source hash differs: {case_id}")
+                rows.append(replace(original_row, case_id=case_id,
+                                    group_id=prepared.case_groups[case_id]))
+                continue
             if (file_sha256(source["image"]) != source["image_sha256"]
                     or file_sha256(source["label"]) != source["label_sha256"]):
                 raise ValueError(f"Original validation source changed: {case_id}")
@@ -42,12 +70,18 @@ def evaluate_validation_group_dice(trainer) -> dict:
             volume = VolumeCase(case_id, prepared.case_groups[case_id], image, target, meta)
             prediction = predict_volume(trainer.network, volume, plans=trainer.plans_manager.plans,
                                         config=trainer.config, stats=prepared.stats, device=trainer.device)
-            rows.append(compute_case_metrics(prediction, target, case_id=case_id,
-                                             group_id=prepared.case_groups[case_id]))
+            row = compute_case_metrics(prediction, target, case_id=case_id,
+                                       group_id=prepared.case_groups[case_id])
+            if on_case is not None:
+                on_case(case_id, volume, prediction)
+            evaluated[identity] = row, source["image_sha256"], source["label_sha256"]
+            rows.append(row)
     finally:
         restore_rng_state(state)
         torch.backends.cudnn.benchmark = benchmark
-    return aggregate_group_metrics(rows)
+    summary = aggregate_group_metrics(rows)
+    summary["per_case"] = [asdict(row) for row in rows]
+    return summary
 
 
 def build_phase3_checkpoint(trainer) -> dict:
@@ -136,9 +170,8 @@ def restore_phase3_state(trainer, payload: dict) -> None:
     load_prepared_for_trainer(trainer, verify_files=True)
     if state["global_step"] and (state["train_loader_state"] is None or state["val_loader_state"] is None):
         raise ValueError("Phase 3 checkpoint lacks sampler state")
-    log_path = Path(state["log_file"])
-    if not log_path.is_file() or log_path.stat().st_size < state["log_bytes"]:
-        raise ValueError("Checkpoint log is missing or shorter than saved boundary")
+    log_path = resolve_saved_log_path(state["log_file"], trainer.output_folder,
+                                      state["log_bytes"])
     with log_path.open("r+b") as stream:
         stream.truncate(state["log_bytes"])
     trainer.current_epoch = state["next_epoch"]

@@ -159,7 +159,9 @@ def resolve_config(raw: dict[str, Any]) -> Phase3Config:
             raise ValueError("Swin depth conflicts with bottleneck")
     _finite(data["fusion"]["alpha_init"], "fusion.alpha_init")
     _fixed(data, template, "tubular", ("dilations",))
-    _fixed(data, template, "segmentation", ("loss", "smooth"))
+    _fixed(data, template, "segmentation", ("smooth",))
+    if data["segmentation"]["loss"] not in ("foreground_dice_bce", "generalized_dice_bce"):
+        raise ValueError("Unsupported segmentation.loss")
     _fixed(data, template, "deep_supervision", ("weights",))
     _fixed(data, template, "projection", ("coordinate_frame", "target_source", "operator_version", "eps"))
     _finite(data["projection"]["weight"], "projection.weight", 0.0)
@@ -170,9 +172,16 @@ def resolve_config(raw: dict[str, Any]) -> Phase3Config:
         raise ValueError("projection.angles must be nonempty")
     for angle in angles:
         _finite(angle, "projection.angle")
-    _fixed(data, template, "normalization", tuple(template["normalization"]))
+    _fixed(data, template, "normalization", tuple(key for key in template["normalization"]
+                                                  if key != "spacing_mm"))
+    spacing = data["normalization"]["spacing_mm"]
+    if not isinstance(spacing, list) or len(spacing) != 3:
+        raise ValueError("normalization.spacing_mm requires three axes")
+    for axis in spacing:
+        _finite(axis, "normalization.spacing_mm", 1e-6)
     _fixed(data, template, "training", ("optimizer", "learning_rate", "momentum", "weight_decay", "nesterov",
-                                     "poly_power", "foreground_probability", "num_workers", "compile"))
+                                     "poly_power", "num_workers", "compile"))
+    _finite(data["training"]["foreground_probability"], "training.foreground_probability", 0.0, 1.0)
     _integer(data["training"]["max_optimizer_steps"], "max_optimizer_steps", 1)
     _integer(data["training"]["updates_per_epoch"], "updates_per_epoch", 1)
     if data["training"]["max_optimizer_steps"] % data["training"]["updates_per_epoch"]:
@@ -180,8 +189,9 @@ def resolve_config(raw: dict[str, Any]) -> Phase3Config:
     _fixed(data, template, "checkpoint", ("selection",))
     _fixed(data, template, "inference", tuple(template["inference"]))
     if data["run_kind"] == "formal":
-        _fixed(data, template, "cnn", ("patch_size", "batch_size"))
-        _fixed(data, template, "training", ("max_optimizer_steps", "updates_per_epoch"))
+        _fixed(data, template, "training", ("updates_per_epoch",))
+        if data["training"]["max_optimizer_steps"] not in (10000, 17500):
+            raise ValueError("Unsupported training.max_optimizer_steps")
     elif (data["training"]["max_optimizer_steps"] >= template["training"]["max_optimizer_steps"]
           or data["training"]["updates_per_epoch"] >= template["training"]["updates_per_epoch"]):
         raise ValueError("Smoke run requires a reduced training budget")

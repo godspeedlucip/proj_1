@@ -20,6 +20,7 @@ from nnunetv2.phase3.network import build_phase3_network
 from nnunetv2.phase3.planning import validate_phase3_plans
 from nnunetv2.phase3.prior_weights import initialize_prior
 from nnunetv2.phase3.training_support import build_phase3_loaders, get_strict_split, prior_artifact_from_context
+from nnunetv2.phase3.tensorboard_reporting import Phase3TensorBoard, ValidationPreviewCollector
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
@@ -36,8 +37,9 @@ class nnUNetTrainerPhase3(nnUNetTrainer):
             raise ValueError("Phase 3 supports CPU smoke or single CUDA training")
         if set(dataset_json.get("channel_names", {})) != {"0", "1"}:
             raise ValueError("Phase 3 requires exactly two input views")
-        if dataset_json.get("labels") != {"background": 0, "stent_struts": 1, "ignore": 2}:
-            raise ValueError("Phase 3 requires background, stent and ignore labels")
+        target_semantics = plans["phase3"].get("target_semantics", "stent_struts")
+        if dataset_json.get("labels") != {"background": 0, target_semantics: 1, "ignore": 2}:
+            raise ValueError("Phase 3 labels differ from the prepared target semantics")
         self.config = resolve_config(plans["phase3"]["config"])
         self.continue_training = bool(plans.get("continue_training", False))
         self.global_step = 0
@@ -46,6 +48,7 @@ class nnUNetTrainerPhase3(nnUNetTrainer):
         self.best_step = None
         self._pending_phase3_state = None
         self._restore_mode = False
+        self._phase3_tensorboard = None
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.initial_lr = self.config.training.learning_rate
         self.weight_decay = self.config.training.weight_decay
@@ -91,6 +94,29 @@ class nnUNetTrainerPhase3(nnUNetTrainer):
         self.dataloader_train, self.dataloader_val = build_phase3_loaders(self)
         return self.dataloader_train, self.dataloader_val
 
+    def on_validation_epoch_end(self, val_outputs: list[dict]) -> None:
+        if not val_outputs:
+            raise ValueError("Phase 3 validation epoch has no patch results")
+        loss = float(np.mean([row["loss"] for row in val_outputs]))
+        if not np.isfinite(loss):
+            raise ValueError("Phase 3 validation patch loss is nonfinite")
+        counts = [np.sum(np.stack([np.asarray(row[key], dtype=np.float64)
+                                   for row in val_outputs]), axis=0)
+                  for key in ("tp_hard", "fp_hard", "fn_hard")]
+        tp, fp, fn = counts
+        denominator = 2 * tp + fp + fn
+        per_class = np.full(denominator.shape, np.nan, dtype=np.float64)
+        np.divide(2 * tp, denominator, out=per_class, where=denominator > 0)
+        defined = denominator > 0
+        mean_dice = float(np.mean(per_class[defined])) if np.any(defined) else float("nan")
+        self.logger.log("mean_fg_dice", mean_dice, self.current_epoch)
+        self.logger.log("dice_per_class_or_region", per_class.tolist(), self.current_epoch)
+        self.logger.log("val_losses", loss, self.current_epoch)
+        if not np.any(defined):
+            self.print_to_log_file("Phase 3 patch validation Dice is undefined: "
+                                   "target and prediction are empty; use full-volume metrics",
+                                   also_print_to_console=False)
+
     def on_train_start(self):
         torch.backends.cudnn.benchmark = False
         if not self.was_initialized:
@@ -105,11 +131,15 @@ class nnUNetTrainerPhase3(nnUNetTrainer):
             self.dataloader_val.load_state_dict(state["val_loader_state"])
             restore_rng_state(state["rng"])
             self._pending_phase3_state = None
+        if self._phase3_tensorboard is None:
+            self._phase3_tensorboard = Phase3TensorBoard(
+                Path(self.output_folder), purge_step=self.global_step + 1)
         torch.backends.cudnn.benchmark = False
 
     def on_epoch_end(self):
         self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        summary = evaluate_validation_group_dice(self)
+        collector = ValidationPreviewCollector(limit=3)
+        summary = evaluate_validation_group_dice(self, on_case=collector.add)
         score = summary["mean"]["dice"]
         if score is None or not np.isfinite(score):
             raise ValueError("Full-volume validation group Dice is nonfinite")
@@ -118,14 +148,35 @@ class nnUNetTrainerPhase3(nnUNetTrainer):
             self.best_group_dice = score
             self.best_step = self.global_step
         self.print_to_log_file(f"Phase 3 validation group Dice: {score:.6f}; best: {self.best_group_dice:.6f}")
+        if self._phase3_tensorboard is None:
+            self._phase3_tensorboard = Phase3TensorBoard(
+                Path(self.output_folder), purge_step=self.global_step + 1)
+        training_scalars = {"train/learning_rate": float(self.optimizer.param_groups[0]["lr"])}
+        for key, tag in (("train_losses", "train/loss"),
+                         ("val_losses", "validation/patch_loss"),
+                         ("mean_fg_dice", "validation/patch_dice")):
+            try:
+                value = self.logger.get_value(key, step=-1)
+            except (KeyError, IndexError, TypeError):
+                continue
+            if value is not None and np.isscalar(value):
+                training_scalars[tag] = float(value)
+        report = self._phase3_tensorboard.log_epoch(
+            self.current_epoch + 1, summary, collector.selected(),
+            training_scalars=training_scalars, step=self.global_step)
+        self.print_to_log_file(f"Phase 3 TensorBoard validation report: {report}")
         self.current_epoch += 1
         if improved:
             self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
+        self.save_checkpoint(str(Path(self.output_folder) /
+                                 f"checkpoint_epoch_{self.current_epoch:04d}.pth"))
         self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_latest.pth"))
 
     def on_train_end(self):
         self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_final.pth"))
         self.print_to_log_file("Phase 3 training complete")
+        if self._phase3_tensorboard is not None:
+            self._phase3_tensorboard.close()
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         summary = evaluate_validation_group_dice(self)
@@ -172,29 +223,54 @@ class nnUNetTrainerPhase3(nnUNetTrainer):
         target = batch["target"]
         target = ([part.to(self.device, non_blocking=True) for part in target]
                   if isinstance(target, list) else target.to(self.device, non_blocking=True))
-        self.optimizer.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", enabled=True) if self.device.type == "cuda" else nullcontext():
-            output = self.network(data)
-            breakdown = self.loss.breakdown(output, target)
-            total = breakdown.total
-        if not torch.isfinite(total):
-            raise ValueError("Nonfinite Phase 3 training loss")
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(total).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-        else:
-            total.backward()
         parameters = [part for part in self.network.parameters() if part.requires_grad]
-        if any(part.grad is not None and not torch.isfinite(part.grad).all() for part in parameters):
-            raise ValueError("Nonfinite Phase 3 training gradient")
-        grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 12)
-        if not torch.isfinite(grad_norm):
-            raise ValueError("Nonfinite Phase 3 gradient norm")
-        if self.grad_scaler is not None:
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            self.optimizer.step()
+        amp_overflow_retries = 0
+        while True:
+            self.optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", enabled=True) if self.device.type == "cuda" else nullcontext():
+                output = self.network(data)
+                breakdown = self.loss.breakdown(output, target)
+                total = breakdown.total
+            if not torch.isfinite(total):
+                raise ValueError("Nonfinite Phase 3 training loss")
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(total).backward()
+                self.grad_scaler.unscale_(self.optimizer)
+            else:
+                total.backward()
+            bad_parameters = [name for name, part in self.network.named_parameters()
+                              if part.requires_grad and part.grad is not None
+                              and not torch.isfinite(part.grad).all()]
+            if bad_parameters:
+                if self.grad_scaler is None or amp_overflow_retries >= 16:
+                    raise ValueError("Nonfinite Phase 3 training gradient: "
+                                     f"{bad_parameters[:8]}; AMP retries={amp_overflow_retries}")
+                scale_before = self.grad_scaler.get_scale()
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+                scale_after = self.grad_scaler.get_scale()
+                if not 0 < scale_after < scale_before:
+                    raise ValueError("Phase 3 AMP overflow did not reduce the gradient scale")
+                amp_overflow_retries += 1
+                self.print_to_log_file("phase3_amp_overflow " + json.dumps({
+                    "global_step": self.global_step + 1,
+                    "keys": list(batch.get("keys", ())),
+                    "retry": amp_overflow_retries,
+                    "scale_before": scale_before,
+                    "scale_after": scale_after,
+                    "nonfinite_parameters": bad_parameters[:8],
+                    "nonfinite_parameter_count": len(bad_parameters),
+                }), also_print_to_console=False)
+                continue
+            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 12)
+            if not torch.isfinite(grad_norm):
+                raise ValueError("Nonfinite Phase 3 gradient norm")
+            if self.grad_scaler is not None:
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                self.optimizer.step()
+            break
         if any(not torch.isfinite(part).all() for part in parameters):
             raise ValueError("Nonfinite Phase 3 parameter after optimizer step")
         self.global_step += 1
@@ -204,13 +280,31 @@ class nnUNetTrainerPhase3(nnUNetTrainer):
                        "fusion": telemetry, "valid_rays": (breakdown.valid_rays.detach().cpu().tolist()
                                                                 if breakdown.valid_rays is not None else None),
                        "aux_valid_samples": list(breakdown.valid_sample_counts),
-                       "amp": self.grad_scaler is not None, "peak_memory_bytes": peak_memory,
+                       "amp": self.grad_scaler is not None,
+                       "amp_overflow_retries": amp_overflow_retries,
+                       "amp_scale": self.grad_scaler.get_scale() if self.grad_scaler is not None else None,
+                       "peak_memory_bytes": peak_memory,
                        "seconds": time.perf_counter() - start}
-        self.print_to_log_file("phase3_step " + json.dumps(diagnostics))
+        self.print_to_log_file("phase3_step " + json.dumps(diagnostics),
+                               also_print_to_console=False)
+        if self._phase3_tensorboard is not None:
+            self._phase3_tensorboard.log_step(self.global_step, {
+                "train/step/total_loss": float(total.detach()),
+                "train/step/segmentation_loss": float(breakdown.segmentation.detach()),
+                "train/step/dice_loss": float(breakdown.dice.detach()),
+                "train/step/bce_loss": float(breakdown.bce.detach()),
+                "train/step/projection_loss": float(breakdown.projection.detach()),
+                "train/step/gradient_norm": float(grad_norm.detach()),
+                "train/step/amp_overflow_retries": amp_overflow_retries,
+                "train/step/amp_scale": self.grad_scaler.get_scale()
+                if self.grad_scaler is not None else None,
+            })
         return {"loss": float(total.detach()), "segmentation": float(breakdown.segmentation.detach()),
                 "dice": float(breakdown.dice.detach()), "bce": float(breakdown.bce.detach()),
                 "projection": float(breakdown.projection.detach()),
-                "grad_norm": float(grad_norm.detach()), "global_step": self.global_step,
+                "grad_norm": float(grad_norm.detach()),
+                "amp_overflow_retries": amp_overflow_retries,
+                "global_step": self.global_step,
                 "keys": list(batch.get("keys", ())), "seconds": time.perf_counter() - start}
 
     @torch.no_grad()

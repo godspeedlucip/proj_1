@@ -25,8 +25,9 @@ class Phase3DataLoader(nnUNetDataLoader):
                  oversample_foreground_percent: float = 0.33, sampling_probabilities=None,
                  pad_sides=None, probabilistic_oversampling: bool = True, transforms=None,
                  *, case_groups: dict[str, str], seed: int):
-        if oversample_foreground_percent != 0.33 or not probabilistic_oversampling or sampling_probabilities is not None:
-            raise ValueError("Phase 3 uses group sampling and foreground Bernoulli p=0.33")
+        if (not 0 <= oversample_foreground_percent <= 1 or not probabilistic_oversampling
+                or sampling_probabilities is not None):
+            raise ValueError("Phase 3 requires group sampling and foreground Bernoulli probability in [0, 1]")
         if type(seed) is not int or seed < 0:
             raise ValueError("Sampling seed must be a nonnegative integer")
         identifiers = tuple(data.identifiers)
@@ -54,6 +55,7 @@ class Phase3DataLoader(nnUNetDataLoader):
         self._python_state = random.Random(seed_for(seed, "phase3_python")).getstate()
         identity = {"cases": cases_by_group, "patch": tuple(int(v) for v in patch_size),
                     "final_patch": tuple(int(v) for v in final_patch_size), "batch": batch_size,
+                    "foreground_probability": float(oversample_foreground_percent),
                     "seed": seed, "transforms": repr(transforms)}
         self._identity = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
@@ -77,7 +79,7 @@ class Phase3DataLoader(nnUNetDataLoader):
             raise ValueError("Loader case, patch, transform or seed identity mismatch")
         self._sampling_rng.bit_generator.state = deepcopy(state["sampling"])
         self._numpy_state = deepcopy(state["numpy"])
-        self._torch_state = state["torch"].clone()
+        self._torch_state = state["torch"].cpu().clone()
         self._python_state = deepcopy(state["python"])
 
     def generate_train_batch(self):

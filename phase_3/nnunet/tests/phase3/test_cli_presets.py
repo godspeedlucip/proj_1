@@ -1,5 +1,7 @@
 import copy
 import itertools
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -50,6 +52,14 @@ def test_h_matrix_and_no_ds_contract():
     assert not configs["no_ds"].deep_supervision.enabled
 
 
+def test_full_gdl_preset_changes_only_loss_selection():
+    original = load_preset("full")
+    gdl = load_preset("full_gdl")
+    expected = original.to_dict()
+    expected["segmentation"]["loss"] = "generalized_dice_bce"
+    assert gdl.to_dict() == expected
+
+
 def test_unknown_preset_and_conflicting_config_fail():
     with pytest.raises(ValueError, match="Unknown preset"):
         load_preset("missing")
@@ -76,7 +86,9 @@ def test_launcher_uses_isolated_env_and_rejects_existing_result(tmp_path, monkey
                            prior_artifact=None, resume=False) == 0
     assert isinstance(seen["args"], list) and "--dataset" in seen["args"]
     assert seen["kwargs"]["env"]["nnUNet_raw"] == str(prepared.raw_root)
-    assert seen["kwargs"]["env"]["PYTHONPATH"].endswith("phase_3\\nnunet")
+    child_path = seen["kwargs"]["env"]["PYTHONPATH"].split(os.pathsep)
+    assert child_path[0] == str(Path(__file__).resolve().parents[2])
+    assert child_path[1:] == ["wrong-package"]
     assert not model_folder(prepared).exists()
     model_folder(prepared).mkdir(parents=True)
     with pytest.raises(FileExistsError):

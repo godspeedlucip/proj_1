@@ -7,22 +7,36 @@ import json
 from pathlib import Path
 import shutil
 
+import nibabel as nib
 import numpy as np
 
 from .config import Phase3Config, config_digest, resolve_config
-from .data_conversion import PreparedFold
-from .nifti_io import read_nifti
+from .data_conversion import PreparedFold, _file_identity, _link_or_copy
 from .provenance import file_sha256
 
 
 def _source_geometry(prepared: PreparedFold) -> tuple[list[int], list[float], dict]:
     case_ids = (*prepared.train_ids, *prepared.validation_ids)
     shapes, spacings = [], []
+    geometry_cache = {}
     for case_id in case_ids:
         image = prepared.raw_dir / "imagesTr" / f"{case_id}_0000.nii.gz"
-        data, meta = read_nifti(image)
-        shapes.append(tuple(int(v) for v in data.shape))
-        spacings.append(tuple(float(v) for v in np.linalg.norm(meta.affine_mm[:3, :3], axis=0)[::-1]))
+        identity = _file_identity(image)
+        if identity not in geometry_cache:
+            nii = nib.load(str(image))
+            unit = nii.header.get_xyzt_units()[0]
+            unit_scale = {"mm": 1.0, "meter": 1000.0, "micron": .001}.get(unit)
+            if len(nii.shape) != 3 or unit_scale is None:
+                raise ValueError(f"Invalid prepared FDK geometry: {image}")
+            shape = tuple(int(v) for v in reversed(nii.shape))
+            spacing = tuple(float(v) for v in
+                            (np.linalg.norm(nii.affine[:3, :3], axis=0) * unit_scale)[::-1])
+            if not np.isfinite(spacing).all() or any(v <= 0 for v in spacing):
+                raise ValueError(f"Invalid prepared FDK spacing: {image}")
+            geometry_cache[identity] = shape, spacing
+        shape, spacing = geometry_cache[identity]
+        shapes.append(shape)
+        spacings.append(spacing)
     median_shape = [int(round(v)) for v in np.median(np.asarray(shapes), axis=0)]
     median_spacing = [float(v) for v in np.median(np.asarray(spacings), axis=0)]
     fingerprint = {
@@ -39,7 +53,11 @@ def _source_geometry(prepared: PreparedFold) -> tuple[list[int], list[float], di
 def make_phase3_plans(prepared: PreparedFold, config: Phase3Config) -> dict:
     if prepared.schema_version != "phase3_prepared_fold_v1" or prepared.nnunet_fold != 0:
         raise ValueError("Expected a Phase 3 prepared fold mapped to nnU-Net fold 0")
-    median_shape, median_spacing, _ = _source_geometry(prepared)
+    median_shape, median_spacing, fingerprint = _source_geometry(prepared)
+    expected_spacing = np.asarray(config.normalization.spacing_mm, dtype=np.float64)
+    measured_spacings = np.asarray(fingerprint["spacings"], dtype=np.float64)
+    if np.any(np.abs(measured_spacings - expected_spacing) > config.normalization.spacing_tolerance_mm):
+        raise ValueError("FDK source spacing differs from configured original voxel size")
     digest = config_digest(config)
     plans_name = "FDKPhase3_" + digest[:12]
     channels = list(config.cnn.channels)
@@ -65,7 +83,7 @@ def make_phase3_plans(prepared: PreparedFold, config: Phase3Config) -> dict:
         "batch_size": config.cnn.batch_size,
         "patch_size": list(config.cnn.patch_size),
         "median_image_size_in_voxels": median_shape,
-        "spacing": [0.2, 0.2, 0.2],
+        "spacing": list(config.normalization.spacing_mm),
         "normalization_schemes": ["NoNormalization", "NoNormalization"],
         "use_mask_for_norm": [False, False],
         "resampling_fn_data": "identity_resample",
@@ -105,6 +123,7 @@ def make_phase3_plans(prepared: PreparedFold, config: Phase3Config) -> dict:
             "stats": prepared.stats.to_dict(),
             "source_fold": prepared.source_fold,
             "nnunet_fold": 0,
+            "target_semantics": prepared.target_semantics,
         },
     }
     validate_phase3_plans(plans)
@@ -128,8 +147,10 @@ def validate_phase3_plans(plans: dict) -> None:
         c = plans["configurations"]["3d_fullres"]
         if c["patch_size"] != list(cfg.cnn.patch_size) or c["batch_size"] != cfg.cnn.batch_size:
             raise ValueError("Patch or batch conflicts with Phase 3 config")
-        if c["spacing"] != [0.2, 0.2, 0.2] or c["normalization_schemes"] != ["NoNormalization"] * 2:
+        if c["spacing"] != list(cfg.normalization.spacing_mm) or c["normalization_schemes"] != ["NoNormalization"] * 2:
             raise ValueError("FDK spacing/normalization contract mismatch")
+        if phase3.get("target_semantics", "stent_struts") not in ("stent_struts", "stent_and_markers"):
+            raise ValueError("Unsupported Phase 3 target semantics")
         if c["use_mask_for_norm"] != [False, False] or c["preprocessor_name"] != "FDKPreprocessor":
             raise ValueError("Unsupported preprocessing")
         for key in ("data", "seg", "probabilities"):
@@ -173,12 +194,26 @@ def prepare_training_fold(prepared: PreparedFold, config: Phase3Config) -> Prepa
     data_dir.mkdir(parents=True, exist_ok=False)
     dataset_json = json.loads((prepared.raw_dir / "dataset.json").read_text(encoding="utf-8"))
     preprocessor = FDKPreprocessor(verbose=False)
+    completed_cases = {}
     for case_id in (*prepared.train_ids, *prepared.validation_ids):
         images = [str(prepared.raw_dir / "imagesTr" / f"{case_id}_{channel:04d}.nii.gz") for channel in (0, 1)]
         label = str(prepared.raw_dir / "labelsTr" / f"{case_id}.nii.gz")
-        preprocessor.run_case_save(str(data_dir / case_id), images, label, manager, configuration, dataset_json)
-    cache_hashes = {path.relative_to(data_dir).as_posix(): file_sha256(path)
-                    for path in sorted(data_dir.rglob("*")) if path.is_file()}
+        identity = tuple(_file_identity(Path(path)) for path in (*images, label))
+        previous = completed_cases.get(identity)
+        if previous is None:
+            preprocessor.run_case_save(str(data_dir / case_id), images, label, manager, configuration, dataset_json)
+            completed_cases[identity] = case_id
+        else:
+            for suffix in (".b2nd", "_seg.b2nd", ".pkl"):
+                _link_or_copy(data_dir / f"{previous}{suffix}", data_dir / f"{case_id}{suffix}")
+    hashed_inodes = {}
+    cache_hashes = {}
+    for path in sorted(data_dir.rglob("*")):
+        if path.is_file():
+            identity = _file_identity(path)
+            if identity not in hashed_inodes:
+                hashed_inodes[identity] = file_sha256(path)
+            cache_hashes[path.relative_to(data_dir).as_posix()] = hashed_inodes[identity]
     if not cache_hashes:
         raise ValueError("Preprocessed Phase 3 cache is empty")
     completed = replace(prepared, plans_name=plans["plans_name"],

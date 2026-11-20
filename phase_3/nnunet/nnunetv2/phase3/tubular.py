@@ -31,9 +31,13 @@ class TubularEnhancement(nn.Module):
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
         if logits.ndim != 5 or logits.shape[1] != self.dil1.in_channels:
             raise ValueError("Expected five-dimensional class logits")
-        branches = [
-            F.leaky_relu(norm(conv(logits)), inplace=True)
-            for conv, norm in ((self.dil1, self.norm_dil1), (self.dil2, self.norm_dil2),
-                               (self.dil3, self.norm_dil3), (self.dil5, self.norm_dil5))
-        ]
-        return logits + self.fusion(torch.cat(branches, dim=1))
+        # The full-resolution Dice gradient can overflow FP16 InstanceNorm and
+        # convolution backward even when its unscaled FP32 gradient is finite.
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            logits = logits.float()
+            branches = [
+                F.leaky_relu(norm(conv(logits)), inplace=True)
+                for conv, norm in ((self.dil1, self.norm_dil1), (self.dil2, self.norm_dil2),
+                                   (self.dil3, self.norm_dil3), (self.dil5, self.norm_dil5))
+            ]
+            return logits + self.fusion(torch.cat(branches, dim=1))

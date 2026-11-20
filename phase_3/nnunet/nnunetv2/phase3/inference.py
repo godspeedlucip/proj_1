@@ -45,7 +45,8 @@ def predict_volume(network, volume: VolumeCase, *, plans: dict, config: Phase3Co
     manager = PlansManager(plans)
     configuration = manager.get_configuration("3d_fullres")
     dataset_json = {"channel_names": {"0": "noNorm", "1": "noNorm"},
-                    "labels": {"background": 0, "stent_struts": 1, "ignore": 2},
+                    "labels": {"background": 0, plans["phase3"].get("target_semantics", "stent_struts"): 1,
+                               "ignore": 2},
                     "file_ending": ".nii.gz"}
     views = make_views(volume, stats)
     spacing = tuple(float(v) for v in np.linalg.norm(volume.meta.affine_mm[:3, :3], axis=0)[::-1])

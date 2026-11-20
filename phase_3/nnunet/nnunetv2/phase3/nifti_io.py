@@ -39,8 +39,8 @@ def read_nifti(path):
     if qcode and scode and not np.allclose(q[:3]*factors[unit],s[:3]*factors[unit],atol=1e-4,rtol=0):
         raise ValueError('Conflicting qform and sform')
     spacing = np.linalg.norm(affine_mm[:3,:3],axis=0)
-    if not np.allclose(spacing,.2,atol=1e-4,rtol=0):
-        raise ValueError(f'Expected 0.2 mm spacing, got {spacing}')
+    if not np.isfinite(spacing).all() or np.any(spacing <= 0):
+        raise ValueError(f'Invalid voxel spacing: {spacing}')
     array = np.asarray(nii.get_fdata(dtype=np.float32))
     if not np.isfinite(array).all(): raise ValueError('Nonfinite NIfTI data')
     return np.ascontiguousarray(array.transpose(2,1,0)), SpatialMeta(tuple(nii.shape),affine,nii.header.copy(),unit,affine_mm)

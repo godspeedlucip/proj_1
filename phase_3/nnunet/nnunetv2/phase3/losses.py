@@ -8,6 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .generalized_dice import masked_generalized_dice
 from .projection import ProjectionConsistencyLoss
 
 
@@ -60,11 +61,41 @@ class MaskedForegroundDiceBCE(nn.Module):
                              (int((counts > 0).sum().item()),))
 
 
+class MaskedGeneralizedDiceBCE(nn.Module):
+    """Per-case inverse-square GDL plus the original BCE; ignore=2 is excluded."""
+
+    def forward(self, logits: Tensor, target: Tensor, *, allow_empty: bool = False) -> LossBreakdown:
+        target = _validate_target(logits, target)
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            z = (logits[:, 1:2] - logits[:, :1]).float()
+            foreground = (target == 1).float()
+            valid = (target != 2).float()
+            counts = valid.sum((1, 2, 3, 4))
+            if not allow_empty and (counts == 0).any():
+                raise ValueError("No valid voxels in sample")
+            probability = torch.sigmoid(z)
+            dice_per_case = masked_generalized_dice(probability, foreground, valid)
+            bce_per_case = (F.binary_cross_entropy_with_logits(z, foreground, reduction="none")
+                            * valid).sum((1, 2, 3, 4)) / counts.clamp_min(1)
+            dice = dice_per_case.mean()
+            bce = bce_per_case.mean()
+            total = dice + bce
+        zero = total * 0
+        return LossBreakdown(total, total, dice, bce, (total,), zero, zero, None,
+                             (int((counts > 0).sum().item()),))
+
+
+SEGMENTATION_LOSSES = {
+    "foreground_dice_bce": MaskedForegroundDiceBCE,
+    "generalized_dice_bce": MaskedGeneralizedDiceBCE,
+}
+
+
 class Phase3CompositeLoss(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.segmentation = MaskedForegroundDiceBCE()
+        self.segmentation = SEGMENTATION_LOSSES[config.segmentation.loss]()
         self.projection = ProjectionConsistencyLoss(config) if config.projection.enabled else None
 
     def breakdown(self, outputs: Tensor | list[Tensor],

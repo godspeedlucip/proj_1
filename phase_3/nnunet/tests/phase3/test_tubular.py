@@ -63,3 +63,21 @@ def test_tubular_identity_and_parameter_defaults():
         module.fusion[3].bias.zero_()
         x = torch.rand((1, 2, 8, 8, 8))
         assert torch.equal(module(x), x)
+
+
+def test_tubular_refinement_keeps_convolutions_fp32_under_autocast():
+    torch.set_num_threads(2)
+    module = TubularEnhancement()
+    dtypes = []
+    hook = module.dil3.register_forward_hook(
+        lambda _module, _inputs, output: dtypes.append(output.dtype))
+    logits = torch.randn((1, 2, 8, 8, 8), requires_grad=True)
+    try:
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = module(logits)
+        output.square().mean().backward()
+    finally:
+        hook.remove()
+    assert dtypes == [torch.float32]
+    assert output.dtype == torch.float32
+    assert torch.isfinite(logits.grad).all()

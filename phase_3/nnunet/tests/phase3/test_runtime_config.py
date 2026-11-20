@@ -29,7 +29,7 @@ def test_formal_config_roundtrips_without_mutable_aliases():
     {"cnn__dimension": "2d"},
     {"cnn__dimension": "3d_cascade_fullres"},
     {"cnn__num_output_channels": 3},
-    {"cnn__patch_size": [96, 128, 128]},
+    {"cnn__patch_size": [100, 128, 128]},
 ])
 def test_rejects_unsupported_or_conflicting_config(change):
     with pytest.raises(ValueError):
@@ -38,13 +38,43 @@ def test_rejects_unsupported_or_conflicting_config(change):
 
 def test_smoke_requires_distinct_budget_and_identity():
     with pytest.raises(ValueError):
-        resolve_config(make_config(run_kind="formal", cnn__patch_size=[32, 32, 32]))
+        resolve_config(make_config(run_kind="formal", training__max_optimizer_steps=4))
     with pytest.raises(ValueError):
         resolve_config(make_config(run_kind="smoke", cnn__patch_size=[32, 32, 32]))
     cfg = resolve_config(make_config(run_kind="smoke", cnn__patch_size=[32, 32, 32],
                                      cnn__batch_size=1, training__max_optimizer_steps=4,
                                      training__updates_per_epoch=2))
     assert cfg.run_kind == "smoke"
+
+
+def test_formal_accepts_patch_selected_by_nnunet_planner():
+    cfg = resolve_config(make_config(cnn__patch_size=[192, 192, 192]))
+    assert cfg.cnn.patch_size == (192, 192, 192)
+    assert config_digest(cfg) != config_digest(resolve_config(make_config()))
+
+
+def test_formal_accepts_sparse_target_foreground_sampling():
+    cfg = resolve_config(make_config(training__foreground_probability=0.9))
+    assert cfg.training.foreground_probability == 0.9
+
+
+def test_formal_accepts_70_epochs_without_invalidating_40_epoch_runs():
+    old = resolve_config(make_config(training__max_optimizer_steps=10000))
+    extended = resolve_config(make_config(training__max_optimizer_steps=17500))
+    assert old.training.max_optimizer_steps // old.training.updates_per_epoch == 40
+    assert extended.training.max_optimizer_steps // extended.training.updates_per_epoch == 70
+    assert config_digest(old) != config_digest(extended)
+    with pytest.raises(ValueError, match="max_optimizer_steps"):
+        resolve_config(make_config(training__max_optimizer_steps=12500))
+
+
+def test_gdl_loss_is_selectable_and_has_distinct_experiment_identity():
+    original = resolve_config(make_config())
+    gdl = resolve_config(make_config(segmentation__loss="generalized_dice_bce"))
+    assert gdl.segmentation.loss == "generalized_dice_bce"
+    assert config_digest(gdl) != config_digest(original)
+    with pytest.raises(ValueError, match="segmentation.loss"):
+        resolve_config(make_config(segmentation__loss="unknown"))
 
 
 def test_import_root_checked_in_fresh_subprocess():

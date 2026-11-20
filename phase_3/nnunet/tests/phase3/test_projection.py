@@ -79,6 +79,23 @@ def test_projection_loss_averages_each_case_and_view_equally():
     assert torch.allclose(ProjectionConsistencyLoss(config)(logits, target), expected.mean(), atol=1e-7)
 
 
+def test_gdl_option_keeps_projection_loss_unchanged():
+    common = dict(run_kind="smoke", cnn__patch_size=[32, 32, 32],
+                  cnn__batch_size=1, training__max_optimizer_steps=4,
+                  training__updates_per_epoch=2)
+    original = ProjectionConsistencyLoss(resolve_config(make_config(**common)))
+    gdl = ProjectionConsistencyLoss(resolve_config(make_config(
+        **common, segmentation__loss="generalized_dice_bce")))
+    logits = torch.zeros((1, 2, 3, 4, 5), requires_grad=True)
+    target = torch.zeros((1, 1, 3, 4, 5), dtype=torch.long)
+    target[0, 0, 1, 1, 1] = 1
+    base = original(logits, target)
+    value = gdl(logits, target)
+    torch.testing.assert_close(value, base)
+    value.backward()
+    assert torch.isfinite(logits.grad).all()
+
+
 def test_projection_support_uses_configured_epsilon():
     geometry = make_projection_geometry((2, 3, 4), (0.,))
     value = torch.ones((1, 1, 2, 3, 4), dtype=torch.float64)

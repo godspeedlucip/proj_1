@@ -3,17 +3,79 @@ import torch
 
 from phase_3.fdk_unet.losses import foreground_dice_bce
 from nnunetv2.phase3.config import resolve_config
-from nnunetv2.phase3.losses import MaskedForegroundDiceBCE, Phase3CompositeLoss
+from nnunetv2.phase3.losses import (MaskedForegroundDiceBCE,
+                                   MaskedGeneralizedDiceBCE, Phase3CompositeLoss)
 from .fixtures import make_config
 
 
-def _config(projection=False, ds=True):
+def _config(projection=False, ds=True, segmentation_loss="foreground_dice_bce"):
     return resolve_config(make_config(run_kind="smoke", cnn__patch_size=[32, 32, 32],
                                       cnn__batch_size=1, training__max_optimizer_steps=4,
                                       training__updates_per_epoch=2,
                                       projection__enabled=projection,
                                       projection__weight=.1 if projection else 0.,
+                                      segmentation__loss=segmentation_loss,
                                       deep_supervision__enabled=ds))
+
+
+def test_gdl_inverse_square_weights_use_both_classes_and_ignore_voxels():
+    logits = torch.zeros((1, 2, 1, 1, 5), requires_grad=True)
+    target = torch.tensor([[[[[1, 0, 0, 0, 2]]]]])
+    result = MaskedGeneralizedDiceBCE()(logits, target)
+    # Four valid voxels: foreground volume 1, background volume 3.
+    # With p=0.5, weights are 1 and 1/9; GDL overlap is 3/8.
+    assert result.dice.item() == pytest.approx(5 / 8)
+    assert result.bce.item() == pytest.approx(torch.log(torch.tensor(2.)).item())
+    result.total.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad[0, :, 0, 0, 4].abs().sum().item() == 0
+
+
+def test_gdl_handles_absent_foreground_and_empty_auxiliary_sample():
+    logits = torch.zeros((2, 2, 1, 1, 4), requires_grad=True)
+    target = torch.tensor([[[[[0, 0, 0, 0]]]], [[[[2, 2, 2, 2]]]]])
+    result = MaskedGeneralizedDiceBCE()(logits, target, allow_empty=True)
+    assert result.dice.item() == pytest.approx(1 / 6)
+    assert torch.isfinite(result.total)
+    result.total.backward()
+    assert logits.grad[1].abs().sum().item() == 0
+    with pytest.raises(ValueError, match="valid"):
+        MaskedGeneralizedDiceBCE()(logits, target)
+
+
+def test_gdl_variant_keeps_original_bce_per_case():
+    logits = torch.zeros((1, 2, 1, 1, 10))
+    logits[0, 1, 0, 0, 0] = -2
+    target = torch.zeros((1, 1, 1, 1, 10), dtype=torch.long)
+    target[0, 0, 0, 0, 0] = 1
+    result = MaskedGeneralizedDiceBCE()(logits, target)
+    original = MaskedForegroundDiceBCE()(logits, target)
+    torch.testing.assert_close(result.bce, original.bce)
+
+
+def test_gdl_large_all_background_patch_is_not_dominated_by_smoothing():
+    logits = torch.zeros((1, 2, 1, 1, 10000), requires_grad=True)
+    target = torch.zeros((1, 1, 1, 1, 10000), dtype=torch.long)
+    result = MaskedGeneralizedDiceBCE()(logits, target)
+    assert result.dice.item() == pytest.approx(1 / 3, abs=1e-5)
+    result.total.backward()
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_gdl_is_selected_for_every_nonzero_deep_supervision_scale():
+    loss = Phase3CompositeLoss(_config(segmentation_loss="generalized_dice_bce"))
+    assert isinstance(loss.segmentation, MaskedGeneralizedDiceBCE)
+    outputs = [torch.zeros((1, 2, n, n, n), requires_grad=True) for n in (8, 4, 2, 2)]
+    targets = [torch.zeros((1, 1, n, n, n), dtype=torch.long) for n in (8, 4, 2, 2)]
+    for target in targets:
+        target[0, 0, 0, 0, 0] = 1
+    result = loss.breakdown(outputs, targets)
+    for index in range(3):
+        reference = MaskedGeneralizedDiceBCE()(outputs[index], targets[index])
+        torch.testing.assert_close(result.segmentation_scales[index], reference.total)
+    result.total.backward()
+    assert all(output.grad is not None for output in outputs[:3])
+    assert outputs[3].grad is None
 
 
 def test_two_logit_loss_matches_old_value_and_foreground_gradient():

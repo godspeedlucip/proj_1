@@ -1,9 +1,11 @@
 import copy
+import json
 from pathlib import Path
 import shutil
 
 import pytest
 import torch
+import numpy as np
 
 from nnunetv2.phase3.checkpointing import build_phase3_checkpoint, evaluate_validation_group_dice
 from nnunetv2.training.nnUNetTrainer.phase3.nnUNetTrainerPhase3 import nnUNetTrainerPhase3
@@ -17,7 +19,7 @@ def test_group_dice_selects_best_independent_of_patch_pseudo_dice(tmp_path, monk
     module = __import__("nnunetv2.training.nnUNetTrainer.phase3.nnUNetTrainerPhase3", fromlist=["evaluate_validation_group_dice"])
     scores = iter((.8, .4))
     monkeypatch.setattr(module, "evaluate_validation_group_dice",
-                        lambda _: {"mean": {"dice": next(scores)}, "group_count": 1})
+                        lambda *args, **kwargs: {"mean": {"dice": next(scores)}, "group_count": 1})
     trainer.global_step = 2
     trainer.logger.log("mean_fg_dice", .1, 0)
     trainer.on_epoch_end()
@@ -26,10 +28,19 @@ def test_group_dice_selects_best_independent_of_patch_pseudo_dice(tmp_path, monk
     trainer.global_step = 4
     trainer.logger.log("mean_fg_dice", .9, 1)
     trainer.on_epoch_end()
+    epoch_1 = Path(trainer.output_folder) / "checkpoint_epoch_0001.pth"
+    epoch_2 = Path(trainer.output_folder) / "checkpoint_epoch_0002.pth"
+    assert epoch_1.is_file() and epoch_2.is_file()
     best_payload = torch.load(best, map_location="cpu", weights_only=False)
+    first_payload = torch.load(epoch_1, map_location="cpu", weights_only=False)
+    second_payload = torch.load(epoch_2, map_location="cpu", weights_only=False)
     latest = torch.load(Path(trainer.output_folder) / "checkpoint_latest.pth", map_location="cpu", weights_only=False)
     assert best_payload["phase3_state"]["best_step"] == 2
     assert best_payload["current_epoch"] == 1
+    assert first_payload["current_epoch"] == 1
+    assert first_payload["phase3_state"]["global_step"] == 2
+    assert second_payload["current_epoch"] == 2
+    assert second_payload["phase3_state"]["global_step"] == 4
     assert latest["current_epoch"] == 2
     assert latest["phase3_state"]["best_group_dice"] == .8
 
@@ -94,6 +105,50 @@ def test_full_volume_validation_uses_original_source_grid(tmp_path, monkeypatch)
     assert 0 <= summary["mean"]["dice"] <= 1
 
 
+def test_undefined_patch_dice_keeps_full_volume_validation_and_epoch_checkpoint(tmp_path, monkeypatch):
+    trainer = _trainer(tmp_path, monkeypatch)
+    trainer.on_train_start()
+    trainer.global_step = trainer.num_iterations_per_epoch
+    trainer.on_validation_epoch_end([{"loss": 0.25, "tp_hard": np.array([0]),
+                                      "fp_hard": np.array([0]), "fn_hard": np.array([0])}])
+    trainer.on_epoch_end()
+    folder = Path(trainer.output_folder)
+    report = json.loads((folder / "validation_metrics/epoch_0001.json").read_text())
+    assert 0 <= report["mean"]["dice"] <= 1
+    assert (folder / "checkpoint_epoch_0001.pth").is_file()
+    assert "patch validation Dice is undefined" in Path(trainer.log_file).read_text(encoding="utf-8")
+    trainer._phase3_tensorboard.close()
+
+
+def test_full_volume_validation_reuses_identical_head_volume(tmp_path, monkeypatch):
+    from nnunetv2.phase3 import checkpointing
+
+    trainer = _trainer(tmp_path, monkeypatch)
+    trainer.initialize()
+    record_path = Path(trainer.preprocessed_dataset_folder_base).parents[1] / "prepared.json"
+    record = json.loads(record_path.read_text())
+    original = record["validation_ids"][0]
+    duplicate = original + "_other_head"
+    record["validation_ids"].append(duplicate)
+    record["source_cases"][duplicate] = dict(record["source_cases"][original])
+    record["case_groups"][duplicate] = record["case_groups"][original]
+    record_path.write_text(json.dumps(record))
+    calls = []
+    original_predict = checkpointing.predict_volume
+
+    def count_predict(*args, **kwargs):
+        calls.append(1)
+        return original_predict(*args, **kwargs)
+
+    monkeypatch.setattr(checkpointing, "predict_volume", count_predict)
+    previews = []
+    summary = evaluate_validation_group_dice(
+        trainer, on_case=lambda case_id, volume, prediction: previews.append(case_id))
+    assert summary["case_count"] == 2
+    assert len(calls) == 1
+    assert previews == [original]
+
+
 def test_copied_model_folder_rebuilds_with_native_predictor(tmp_path, monkeypatch):
     from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
     trainer = _trainer(tmp_path, monkeypatch)
@@ -117,6 +172,14 @@ def test_native_two_epoch_smoke_keeps_best_and_latest(tmp_path, monkeypatch):
     assert trainer.global_step == 4 and trainer.current_epoch == 2
     assert (folder / "checkpoint_best.pth").is_file()
     assert (folder / "checkpoint_latest.pth").is_file()
+    assert sorted(path.name for path in folder.glob("checkpoint_epoch_*.pth")) == [
+        "checkpoint_epoch_0001.pth", "checkpoint_epoch_0002.pth"]
     final = torch.load(folder / "checkpoint_final.pth", map_location="cpu", weights_only=False)
     assert final["current_epoch"] == 2
     assert final["phase3_state"]["global_step"] == 4
+    assert len(list((folder / "validation_previews/epoch_0001").glob("*.png"))) == 3
+    assert len(list((folder / "validation_previews/epoch_0002").glob("*.png"))) == 3
+    report = json.loads((folder / "validation_metrics/epoch_0002.json").read_text())
+    assert 0 <= report["mean"]["dice"] <= 1
+    assert report["mean"]["mse"] >= 0
+    assert list((folder / "tensorboard").glob("events.out.tfevents.*"))

@@ -85,8 +85,12 @@ def test_metrics_match_legacy_case_and_group_definitions(tmp_path):
     prediction = Prediction(mask.astype(np.float32), mask, meta, {})
     old = old_metrics(prediction, target, case_id="c", group_id="g")
     current = compute_case_metrics(prediction, target, case_id="c", group_id="g")
-    assert asdict(current) == asdict(old)
+    assert {key: getattr(current, key) for key in asdict(old)} == asdict(old)
+    assert np.isclose(current.mse, np.mean((mask.astype(np.float32) - target) ** 2))
+    assert np.isclose(current.mae, np.mean(np.abs(mask.astype(np.float32) - target)))
+    assert np.isclose(current.iou, np.count_nonzero(mask & target) / np.count_nonzero(mask | target))
     assert aggregate_group_metrics([current])["mean"]["dice"] == current.dice
+    assert aggregate_group_metrics([current])["mean"]["mse"] == current.mse
 
 
 def test_predictor_failure_restores_training_and_ds_state(tmp_path, monkeypatch):

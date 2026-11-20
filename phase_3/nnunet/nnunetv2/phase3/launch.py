@@ -47,6 +47,7 @@ def launch_training(prepared: PreparedFold, config: Phase3Config, *, seed: int,
         raise ValueError("Prior artifact is only valid for a new SSL training run")
     root = Path(__file__).resolve().parents[2]
     environment = os.environ.copy()
+    child_pythonpath = os.pathsep.join(filter(None, (str(root), environment.get("PYTHONPATH"))))
     environment.update({
         "nnUNet_raw": str(prepared.raw_root),
         "nnUNet_preprocessed": str(prepared.preprocessed_root),
@@ -56,7 +57,7 @@ def launch_training(prepared: PreparedFold, config: Phase3Config, *, seed: int,
         "OMP_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
         "OPENBLAS_NUM_THREADS": "1",
-        "PYTHONPATH": str(root),
+        "PYTHONPATH": child_pythonpath,
     })
     environment.pop("nnUNet_extTrainer", None)
     context = {"schema_version": "phase3_run_context_v1",
@@ -73,7 +74,11 @@ def launch_training(prepared: PreparedFold, config: Phase3Config, *, seed: int,
             "--device", device]
     if resume:
         args.append("--resume")
-    result = subprocess.run(args, cwd=str(root), env=environment, check=False)
+    lock_fds = tuple(int(fd) for fd in environment.get("PHASE3_LOCK_FDS", "").split(",") if fd)
+    for fd in lock_fds:
+        os.fstat(fd)
+    result = subprocess.run(args, cwd=str(root), env=environment, check=False,
+                            **({"pass_fds": lock_fds} if lock_fds else {}))
     return int(result.returncode)
 
 

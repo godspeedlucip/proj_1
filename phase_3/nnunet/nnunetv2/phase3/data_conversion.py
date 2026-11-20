@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import shutil
 
@@ -42,6 +43,7 @@ class PreparedFold:
     preprocessed_complete: bool = False
     source_cases: dict[str, dict[str, str]] = field(default_factory=dict)
     preprocessed_file_hashes: dict[str, str] = field(default_factory=dict)
+    target_semantics: str = "stent_struts"
 
     @property
     def raw_root(self) -> Path:
@@ -78,6 +80,7 @@ class PreparedFold:
             "preprocessed_complete": self.preprocessed_complete,
             "source_cases": self.source_cases,
             "preprocessed_file_hashes": self.preprocessed_file_hashes,
+            "target_semantics": self.target_semantics,
         }
 
     @classmethod
@@ -92,6 +95,7 @@ class PreparedFold:
         converted["stats"] = PriorStats.from_dict(converted["stats"])
         converted.setdefault("source_cases", {})
         converted.setdefault("preprocessed_file_hashes", {})
+        converted.setdefault("target_semantics", "stent_struts")
         return cls(**converted)
 
 
@@ -124,6 +128,19 @@ def _write_view(array: np.ndarray, meta: SpatialMeta, path: Path) -> None:
     nib.save(nii, path)
 
 
+def _file_identity(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino
+
+
+def _link_or_copy(source: Path, destination: Path) -> None:
+    """Reuse immutable case data on the same filesystem."""
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
 def prepare_raw_fold(manifest: Manifest, splits: dict[int, FoldSplit], *, source_fold: int,
                      dataset_id: int, output: Path, stats_seed: int = 2026) -> PreparedFold:
     """Write one fold's train/validation images; retain test only in provenance."""
@@ -152,6 +169,14 @@ def prepare_raw_fold(manifest: Manifest, splits: dict[int, FoldSplit], *, source
     test_ids = tuple(sorted(c.case_id for c in test_cases))
     if not train_ids or not validation_ids or not test_ids:
         raise ValueError("Each fold partition requires at least one case")
+    source_hashes: dict[tuple[int, int], str] = {}
+
+    def source_hash(path: Path) -> str:
+        identity = _file_identity(path)
+        if identity not in source_hashes:
+            source_hashes[identity] = file_sha256(path)
+        return source_hashes[identity]
+
     prepared = PreparedFold(
         PREPARED_SCHEMA, dataset_name, source_fold, 0, train_ids, validation_ids, test_ids,
         raw_dir, preprocessed_dir, results_dir,
@@ -161,23 +186,35 @@ def prepare_raw_fold(manifest: Manifest, splits: dict[int, FoldSplit], *, source
         json_digest(stats.to_dict()), stats,
         source_cases={case.case_id: {
             "image": str(case.image), "label": str(case.label),
-            "image_sha256": file_sha256(case.image),
-            "label_sha256": file_sha256(case.label),
+            "image_sha256": source_hash(case.image),
+            "label_sha256": source_hash(case.label),
         } for case in (*train_cases, *validation_cases)},
+        target_semantics=manifest.target_semantics,
     )
     (raw_dir / "imagesTr").mkdir(parents=True, exist_ok=False)
     (raw_dir / "labelsTr").mkdir(parents=True, exist_ok=False)
     preprocessed_dir.mkdir(parents=True, exist_ok=False)
     results_dir.mkdir(parents=True, exist_ok=False)
+    completed_cases: dict[tuple[tuple[int, int], tuple[int, int]], str] = {}
     for case in (*train_cases, *validation_cases):
-        volume = load_volume(case, require_label=True)
-        views = make_views(volume, stats)
-        for channel, view in enumerate(views):
-            _write_view(view, volume.meta, raw_dir / "imagesTr" / f"{case.case_id}_{channel:04d}.nii.gz")
-        shutil.copy2(case.label, raw_dir / "labelsTr" / f"{case.case_id}.nii.gz")
+        identity = (_file_identity(case.image), _file_identity(case.label))
+        previous = completed_cases.get(identity)
+        if previous is None:
+            volume = load_volume(case, require_label=True)
+            views = make_views(volume, stats)
+            for channel, view in enumerate(views):
+                _write_view(view, volume.meta, raw_dir / "imagesTr" / f"{case.case_id}_{channel:04d}.nii.gz")
+            _link_or_copy(case.label, raw_dir / "labelsTr" / f"{case.case_id}.nii.gz")
+            completed_cases[identity] = case.case_id
+        else:
+            for channel in (0, 1):
+                _link_or_copy(raw_dir / "imagesTr" / f"{previous}_{channel:04d}.nii.gz",
+                              raw_dir / "imagesTr" / f"{case.case_id}_{channel:04d}.nii.gz")
+            _link_or_copy(raw_dir / "labelsTr" / f"{previous}.nii.gz",
+                          raw_dir / "labelsTr" / f"{case.case_id}.nii.gz")
     dataset_json = {
         "channel_names": {"0": "noNorm", "1": "noNorm"},
-        "labels": {"background": 0, "stent_struts": 1, "ignore": 2},
+        "labels": {"background": 0, manifest.target_semantics: 1, "ignore": 2},
         "numTraining": len(train_ids) + len(validation_ids),
         "file_ending": ".nii.gz",
         "overwrite_image_reader_writer": "FDKNiftiIO",

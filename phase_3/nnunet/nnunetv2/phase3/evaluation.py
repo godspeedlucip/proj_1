@@ -24,17 +24,33 @@ class CaseMetrics:
     target_components: int
     skeleton_distance_mm: float | None
     empty_status: str
+    iou: float
+    mse: float
+    mae: float
 
 
 def compute_case_metrics(prediction: Prediction, target: np.ndarray, *, case_id: str,
                          group_id: str) -> CaseMetrics:
     predicted, truth = prediction.mask, target
+    probability = np.asarray(prediction.probability)
     if (predicted.shape != truth.shape or not np.isin(predicted, (0, 1)).all()
-            or not np.isin(truth, (0, 1)).all()):
-        raise ValueError("Metrics require matching binary original-grid masks")
+            or not np.isin(truth, (0, 1)).all() or probability.shape != truth.shape
+            or not np.isfinite(probability).all()
+            or np.any((probability < 0) | (probability > 1))):
+        raise ValueError("Metrics require aligned binary masks and finite foreground probabilities")
+    squared_error = 0.0
+    absolute_error = 0.0
+    for start in range(0, truth.shape[0], 16):
+        difference = probability[start:start + 16].astype(np.float32, copy=False) - truth[start:start + 16]
+        squared_error += float(np.square(difference, dtype=np.float64).sum())
+        absolute_error += float(np.abs(difference, dtype=np.float64).sum())
+    mse = squared_error / truth.size
+    mae = absolute_error / truth.size
     predicted, truth = predicted.astype(bool), truth.astype(bool)
     n_pred, n_target = int(predicted.sum()), int(truth.sum())
     overlap = int((predicted & truth).sum())
+    union = n_pred + n_target - overlap
+    iou = overlap / union if union else 1.0
     status, distance = "none", None
     if not n_pred and not n_target:
         dice = precision = recall = 1.
@@ -61,15 +77,16 @@ def compute_case_metrics(prediction: Prediction, target: np.ndarray, *, case_id:
     return CaseMetrics(case_id, group_id, float(dice), float(precision), float(recall),
                        float((n_pred - overlap) * abs(np.linalg.det(prediction.meta.affine_mm[:3, :3]))),
                        int(label(predicted, structure)[1]), int(label(truth, structure)[1]),
-                       distance, status)
+                       distance, status, float(iou), float(mse), float(mae))
 
 
 def aggregate_group_metrics(rows) -> dict:
     rows = list(rows)
     if not rows or len({row.case_id for row in rows}) != len(rows):
         raise ValueError("Empty or duplicate case metrics")
-    keys = ("dice", "precision", "recall", "false_positive_mm3", "pred_components",
-            "target_components", "skeleton_distance_mm")
+    keys = ("dice", "iou", "mse", "mae", "precision", "recall",
+            "false_positive_mm3", "pred_components", "target_components",
+            "skeleton_distance_mm")
     groups = {}
     for group_id in sorted({row.group_id for row in rows}):
         members = [row for row in rows if row.group_id == group_id]

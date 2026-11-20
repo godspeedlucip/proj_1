@@ -13,6 +13,41 @@ def json_digest(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 
 
+def manifest_digest_matches(path, manifest, expected_digest):
+    """Accept a moved Dataset603 manifest only when its old form hashes exactly."""
+    current = manifest.to_dict()
+    if json_digest(current) == expected_digest:
+        return True
+    relocation_path = Path(path).parent / 'relocation.json'
+    if not relocation_path.is_file():
+        return False
+    relocation = json.loads(relocation_path.read_text(encoding='utf-8'))
+    if (relocation.get('schema_version') != 'phase3_dataset603_relocation_v1'
+            or relocation.get('original_manifest_digest') != expected_digest
+            or relocation.get('relocated_manifest_digest') != json_digest(current)):
+        return False
+    old_raw = relocation.get('old_raw_prefix')
+    new_raw = relocation.get('new_raw_prefix')
+    old_test = relocation.get('old_test_label_prefix')
+    new_test = relocation.get('new_test_label_prefix')
+    if not all(isinstance(x, str) and x.startswith('/') for x in
+               (old_raw, new_raw, old_test, new_test)):
+        return False
+    original = json.loads(json.dumps(current))
+    for case in original['cases']:
+        image, label = case['image'], case['label']
+        if not image.startswith(new_raw + '/imagesTr/') and not image.startswith(new_raw + '/imagesTs/'):
+            return False
+        case['image'] = old_raw + image[len(new_raw):]
+        if label == new_test + '/' + case['case_id'] + '.nii.gz':
+            case['label'] = old_test + '/' + case['case_id'] + '_stent.nii.gz'
+        elif label.startswith(new_raw + '/labelsTr/'):
+            case['label'] = old_raw + label[len(new_raw):]
+        else:
+            return False
+    return json_digest(original) == expected_digest
+
+
 @dataclass(frozen=True)
 class CaseRecord:
     case_id: str
@@ -65,15 +100,21 @@ def manifest_from_dict(raw, base):
         ids=c.get('source_model_ids')
         if not isinstance(ids,list) or not ids or any(not isinstance(i,str) or not i for i in ids):
             raise ValueError('source_model_ids required')
-        if c.get('input_kind')!='fdk_3view' or c.get('projection_source') not in ('measured','predicted_mask','ideal_mask'):
+        kind = c.get('input_kind')
+        if kind not in ('fdk_3view', 'fdk_sparse') or c.get('projection_source') not in ('measured','predicted_mask','ideal_mask','simulated_stent_projection'):
             raise ValueError('Unknown input/projection source')
         angles=c.get('angles_deg',[])
-        if not isinstance(angles,list) or (angles and (len(angles)!=3 or not np.isfinite(angles).all())):
-            raise ValueError('Expected three finite angles')
+        if not isinstance(angles,list) or any(type(a) not in (int, float) for a in angles):
+            raise ValueError('Expected a list of numeric angles')
+        if kind == 'fdk_3view':
+            if angles and (len(angles)!=3 or not np.isfinite(angles).all()):
+                raise ValueError('Expected three finite angles')
+        elif len(angles) < 2 or not np.isfinite(angles).all() or np.any(np.diff(angles) <= 0) or angles[-1] - angles[0] >= 360:
+            raise ValueError('Sparse FDK requires distinct increasing finite angles within one rotation')
         image=(Path(base)/c['image']).resolve()
         label=(Path(base)/c['label']).resolve() if c.get('label') else None
         cases.append(CaseRecord(c['case_id'],c['group_id'],tuple(ids),c.get('patient_id'),image,label,
-                                tuple(angles),c['projection_source'],c.get('upstream_run_id')))
+                                tuple(angles),c['projection_source'],c.get('upstream_run_id'),kind))
     if not cases: raise ValueError('Manifest is empty')
     return Manifest(tuple(cases),raw.get('upstream_registry',{}),raw.get('target_semantics','unknown'),
                     str(raw.get('source_directory',Path(base).resolve())),raw.get('group_provenance',{}))
@@ -108,37 +149,56 @@ def select_cases(manifest,split,split_name):
 
 
 def input_digest(manifest, groups, *, include_labels=False):
-    rows=[]
+    rows=[];hashes={}
+    def hash_once(path):
+        stat=path.stat();key=(stat.st_dev,stat.st_ino)
+        if key not in hashes:hashes[key]=file_sha256(path)
+        return hashes[key]
     for c in sorted(manifest.cases,key=lambda c:c.case_id):
         if c.group_id in groups:
-            rows.append({'case_id':c.case_id,'group_id':c.group_id,'image_sha256':file_sha256(c.image),
-                         'label_sha256':file_sha256(c.label) if include_labels and c.label else None})
+            rows.append({'case_id':c.case_id,'group_id':c.group_id,'image_sha256':hash_once(c.image),
+                         'label_sha256':hash_once(c.label) if include_labels and c.label else None})
     return json_digest(rows)
 
 
 def validate_data(manifest,splits,*,formal):
-    if manifest.target_semantics!='stent_struts':
-        raise ValueError('Target must be verified stent struts; vessel labels are blood vessels')
+    if manifest.target_semantics not in ('stent_struts', 'stent_and_markers'):
+        raise ValueError('Target must be verified stent struts or stent plus markers')
     if formal and len({c.projection_source for c in manifest.cases})!=1:
         raise ValueError('Formal comparisons require one fixed projection_source; use separate condition-specific runs')
     groups={c.group_id for c in manifest.cases}
     if formal and any(not manifest.group_provenance.get(g) for g in groups):
         raise ValueError('Formal data require group_provenance evidence for every group')
     source_owner={};patient_owner={};path_owner={};content_owner={};rows=[]
+    decoded={};hashes={}
+    def hash_once(path):
+        stat=path.stat();key=(stat.st_dev,stat.st_ino)
+        if key not in hashes:hashes[key]=file_sha256(path)
+        return hashes[key]
     for c in manifest.cases:
-        if formal and len(c.angles_deg)!=3: raise ValueError('Formal three-view angles missing')
+        if formal and ((c.input_kind == 'fdk_3view' and len(c.angles_deg) != 3)
+                       or (c.input_kind == 'fdk_sparse' and len(c.angles_deg) < 2)):
+            raise ValueError('Formal acquisition angles missing')
         for owner,keys in ((source_owner,c.source_model_ids),(patient_owner,(c.patient_id,) if c.patient_id else ())):
             for key in keys:
                 if key in owner and owner[key]!=c.group_id: raise ValueError('Shared/transitive source crosses groups')
                 owner[key]=c.group_id
-        volume=load_volume(c,require_label=c.label is not None)
-        digest=hashlib.sha256(volume.image_raw.astype('<f4').tobytes()).hexdigest()
+        image_stat=c.image.stat()
+        label_stat=c.label.stat() if c.label else None
+        identity=((image_stat.st_dev,image_stat.st_ino),
+                  (label_stat.st_dev,label_stat.st_ino) if label_stat else None)
+        if identity not in decoded:
+            volume=load_volume(c,require_label=c.label is not None)
+            digest=hashlib.sha256(volume.image_raw.astype('<f4').tobytes()).hexdigest()
+            grid_digest=json_digest(np.round(volume.meta.affine_mm,6).tolist())
+            decoded[identity]=digest,grid_digest
+        digest,grid_digest=decoded[identity]
         for owner,key in ((path_owner,str(c.image)),(content_owner,digest)):
             if key in owner and owner[key]!=c.group_id: raise ValueError('Duplicate image across groups')
             owner[key]=c.group_id
-        rows.append(dict(case_id=c.case_id,image_sha256=file_sha256(c.image),
-                         label_sha256=file_sha256(c.label) if c.label else None,
-                         decoded_sha256=digest,grid_digest=json_digest(np.round(volume.meta.affine_mm,6).tolist())))
+        rows.append(dict(case_id=c.case_id,image_sha256=hash_once(c.image),
+                         label_sha256=hash_once(c.label) if c.label else None,
+                         decoded_sha256=digest,grid_digest=grid_digest))
     for split in splits.values():
         parts=[set(getattr(split,k)) for k in ('train','validation','test')]
         if any(not p for p in parts) or set.union(*parts)!=groups or sum(map(len,parts))!=len(groups):

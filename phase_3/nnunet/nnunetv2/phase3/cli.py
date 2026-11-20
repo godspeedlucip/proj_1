@@ -14,10 +14,11 @@ import torch
 
 from .config import Phase3Config, resolve_config
 from .data_conversion import PreparedFold, prepare_raw_fold
+from .dataset601 import import_dataset601
 from .evaluation import aggregate_group_metrics, compute_case_metrics
 from .inference import Prediction, predict_volume, write_prediction
 from .launch import launch_training
-from .manifest import json_digest, load_manifest, load_splits, select_cases, validate_data
+from .manifest import json_digest, load_manifest, load_splits, manifest_digest_matches, select_cases, validate_data
 from .nifti_io import VolumeCase, load_volume, read_nifti
 from .planning import prepare_training_fold
 from .prior_stats import PriorStats
@@ -27,7 +28,7 @@ from .runtime import verify_runtime
 
 
 PRESET_NAMES = ("baseline", "swin", "tubular", "projection", "swin_tubular",
-                "swin_projection", "tubular_projection", "full", "random_prior",
+                "swin_projection", "tubular_projection", "full", "full_gdl", "random_prior",
                 "h00", "h01", "h10", "h11", "no_ds", "smoke")
 PRESET_DIR = Path(__file__).resolve().parents[2] / "configs" / "phase3"
 
@@ -116,7 +117,7 @@ def _predict_command(args) -> int:
     splits = load_splits(args.splits)
     split = splits[args.source_fold]
     if (args.source_fold != plans["phase3"]["source_fold"]
-            or json_digest(manifest.to_dict()) != plans["phase3"]["manifest_digest"]
+            or not manifest_digest_matches(args.manifest, manifest, plans["phase3"]["manifest_digest"])
             or json_digest(split.to_dict()) != plans["phase3"]["split_digest"]):
         raise ValueError("Experimental prediction data differs from model fold")
     cases = select_cases(manifest, split, args.split_name)
@@ -182,6 +183,11 @@ def _evaluate_command(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="phase3-nnunet")
     commands = parser.add_subparsers(dest="command", required=True)
+    for import_name in ("import-fdk-dataset", "import-dataset601"):
+        dataset_import = commands.add_parser(import_name)
+        dataset_import.add_argument("--source", required=True)
+        dataset_import.add_argument("--config", default="full", help="Preset name or full JSON config")
+        dataset_import.add_argument("--output", required=True)
     validate = commands.add_parser("validate-data")
     validate.add_argument("--manifest", required=True)
     validate.add_argument("--splits", required=True)
@@ -226,7 +232,14 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--split-name", choices=("validation", "test"), required=True)
     evaluate.add_argument("--output", required=True)
     args = parser.parse_args(argv)
-    verify_runtime(Path(__file__).resolve().parents[2])
+    verify_runtime(Path(__file__).resolve().parents[2],
+                   require_monai=args.command in ("train", "predict"))
+    if args.command in ("import-fdk-dataset", "import-dataset601"):
+        paths = import_dataset601(Path(args.source), Path(args.output),
+                                  _load_config(args.config, None))
+        print(json.dumps({"manifest": str(paths[0]), "splits": str(paths[1]),
+                          "config": str(paths[2])}, indent=2))
+        return 0
     if args.command == "validate-data":
         manifest = load_manifest(args.manifest, require_labels=True)
         report = validate_data(manifest, load_splits(args.splits), formal=args.run_kind == "formal")
