@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import tifffile
@@ -57,6 +57,7 @@ def validate_prediction_package(
     manifest: str | Path | dict[str, Any],
     package: str | Path | dict[str, Any],
     phase2_fold_id: str,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Validate exact (case_id, view_id) joins, geometry, splits, and sources.
 
@@ -86,6 +87,7 @@ def validate_prediction_package(
     if not isinstance(samples, list) or not samples or not isinstance(cases, list):
         raise DatasetValidationError("manifest.samples and package.cases must be lists (samples non-empty)")
     sample_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    image_shapes: dict[tuple[str, int], tuple[int, int]] = {}
     nnunet_ids: set[str] = set()
     group_views: dict[str, dict[str, set[int]]] = {}
     for sample in samples:
@@ -126,6 +128,7 @@ def validate_prediction_package(
             raise DatasetValidationError(f"cannot read projection for {key}: {exc}") from exc
         if image.ndim != 2 or not np.issubdtype(image.dtype, np.number) or not np.isfinite(image).all():
             raise DatasetValidationError(f"projection for {key} must be a finite 2D numeric image")
+        image_shapes[key] = image.shape
         if mask is not None:
             mask_path = _resolved(manifest_root, mask)
             if not mask_path.is_file():
@@ -135,6 +138,8 @@ def validate_prediction_package(
                 raise DatasetValidationError(f"projection/mask shape mismatch for {key}")
             if not np.isfinite(label).all() or not np.isin(label, (0, 1)).all():
                 raise DatasetValidationError(f"mask for {key} must contain only binary labels 0 and 1")
+        if progress and (len(sample_by_key) % 300 == 0 or len(sample_by_key) == len(samples)):
+            progress(f"Validated {len(sample_by_key)}/{len(samples)} views")
     for case_id, group_map in group_views.items():
         if len(group_map) != 1:
             raise DatasetValidationError(f"case {case_id!r} maps to multiple groups")
@@ -172,10 +177,9 @@ def validate_prediction_package(
                 raise DatasetValidationError(f"prediction has no exact manifest match for {key}")
             if sample["group_id"] != case["group_id"] or sample["geometry_id"] != case["geometry_id"]:
                 raise DatasetValidationError(f"group/geometry mismatch for {key}")
-            image_path = _resolved(manifest_root, sample["projection_path"])
-            image = tifffile.imread(image_path)
             size = view.get("image_size")
-            if size != [int(image.shape[0]), int(image.shape[1])]:
+            shape = image_shapes[key]
+            if size != [int(shape[0]), int(shape[1])]:
                 raise DatasetValidationError(f"image_size mismatch for {key}")
             status = view.get("pair_status")
             if status not in ("reliable", "uncertain", "invalid"):
@@ -191,7 +195,7 @@ def validate_prediction_package(
                 points, radii = view.get("marker_xy"), view.get("error_radius_px")
                 if not isinstance(points, list) or len(points) != 2 or not isinstance(radii, list) or len(radii) != 2:
                     raise DatasetValidationError(f"valid view {key} requires two points and error radii")
-                h, w = image.shape
+                h, w = shape
                 for point in points:
                     if not isinstance(point, list) or len(point) != 2:
                         raise DatasetValidationError(f"invalid point for {key}")

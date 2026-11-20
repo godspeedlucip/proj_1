@@ -1,5 +1,7 @@
 # Phase 2：Marker 引导的 nnU-Net E5-U
 
+本机 Dataset501 的每轮真实投影分割、断点续训和 TensorBoard 命令见 [真实数据监测说明](docs/real-epoch-monitoring.md)。
+
 本文介绍当前实现的网络、输入数据格式、运行流程和可调参数。首版实现的是 **E5-U**：原始投影加 Marker 点先验、有限线段带状先验，以及有效性门控。它保留 nnU-Net 的 plans、原生 decoder、loss、深监督、checkpoint 和滑窗推理；先验分支只在高分辨率 encoder skip 上调制图像特征。
 
 E5-U 的第四通道是二值有效性图，不是连续置信度。Phase 1 的有效点对即使 `q_pair=null` 也能使用；当前实现不运行依赖校准可靠度的 E5，也不包含 FiLM、DCNv2 或 clDice 训练损失。合成 smoke 只验证软件链路，不代表分割效果。
@@ -248,6 +250,8 @@ nnUNetv2_predict `
 
 ## 6. 当前验证状态与运行限制
 
-先验转换、适配器和增强单测曾验证为 **17 passed**；真实 nnU-Net `plan_and_preprocess → train → checkpoint reload → predict` 集成 smoke 仍未完成。当前环境安装的 `batchgenerators 0.25.1` 低于 nnU-Net `pyproject.toml` 要求的 `>=0.25.5`，导入 Trainer 时会因缺少 `SEG_TIEBREAKS` 失败。安装满足仓库依赖的环境后，还需先实现上面说明的 Phase 1 → Phase 2 输入适配器，再运行端到端 smoke。
+本机 Dataset501 已完成数据完整性校验、2D planning/preprocessing、GPU smoke 训练、`checkpoint_final.safetensors` 重新加载及测试图推理。正式 Trainer 已在运行；每轮对固定真实帧的分割与 TensorBoard 监测见上方链接。运行环境所需的较新依赖安装在 `output/phase2_nnunet/deps`，完整运行命令见监测说明。Dataset501 的训练先验来自几何真值；真实帧监测使用 Phase 1 点预测，两者来源不同。
 
-即使合成 smoke 通过，它也只证明软件链路可运行。真实实验还需核对数据几何、来源审计、GPU 内存、组间划分和先验参数，并在真实折外数据上评价；本网络实现本身不构成性能提升证据。
+2026-11-11 14:47 启动的当前 nnU-Net 训练与此前完成的 1000 轮实验曾复用同一结果目录。旧实验产物已按用户要求删除，当前训练第 68 轮 checkpoint 的真实帧测试及结果目录见运行说明。第 4–68 轮的逐轮真实帧输出曾误读旧文件，不能用于当前训练判断；第 69 轮起已恢复正确监测。当前第 68 轮权重在合成验证集的 marker 开关消融中平均 Dice 差值为 +0.000221（病例重采样 95% 区间 [+0.000106, +0.000335]）；验证集 marker 是几何真值，真实帧无标签，尚不能推出 Phase 1 预测点在真实数据上的精度收益。
+
+第 300 轮 checkpoint 的配对消融见 `output/phase2_nnunet/ablation_current_best_epoch300/summary.json`：150 张合成验证图的 marker 开启/关闭 Dice 分别为 0.942892/0.942887，差值 +0.0000044；三张真实帧关闭门控分别改变 11、17、3 个像素。第 425 轮刷新训练 EMA pseudo Dice 后，固定整图复测的 marker 开启/关闭 Dice 为 0.941754/0.941903，差值 -0.000149，见 `output/phase2_nnunet/ablation_current_best_epoch425/summary.json`。训练内的随机 patch EMA 排序与固定整图 Dice 排序不同；目前不能声称 marker 已稳定改善分割精度。真实帧无标签，无法验证真实数据精度。
