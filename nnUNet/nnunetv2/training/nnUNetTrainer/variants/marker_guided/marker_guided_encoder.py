@@ -28,12 +28,12 @@ class MarkerGuidedPriorEncoder(nn.Module):
         self.projections = nn.ModuleDict({str(i): nn.Conv2d(prior_width, feature_channels[i], 1)
                                           for i in self.stage_indices})
 
+    def project_level(self, encoded: torch.Tensor, index: int, size) -> torch.Tensor:
+        level = F.interpolate(encoded, size=size, mode="bilinear", align_corners=False)
+        return self.projections[str(index)](level)
+
     def forward(self, priors: torch.Tensor, skip_shapes: list[tuple[int, int]]) -> dict[int, torch.Tensor]:
         encoded = self.stem(priors)
         if len(skip_shapes) <= max(self.stage_indices):
             raise ValueError("skip shape list does not contain the selected plans stages")
-        result = {}
-        for index in self.stage_indices:
-            level = F.interpolate(encoded, size=skip_shapes[index], mode="bilinear", align_corners=False)
-            result[index] = self.projections[str(index)](level)
-        return result
+        return {i: self.project_level(encoded, i, skip_shapes[i]) for i in self.stage_indices}

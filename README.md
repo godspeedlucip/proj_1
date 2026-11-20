@@ -6,6 +6,14 @@
 
 E5-U 的第四通道是二值有效性图，不是连续置信度。Phase 1 的有效点对即使 `q_pair=null` 也能使用；当前实现不运行依赖校准可靠度的 E5，也不包含 FiLM、DCNv2 或 clDice 训练损失。合成 smoke 只验证软件链路，不代表分割效果。
 
+### 联合分割与深度模型的全级 marker 对照
+
+二维深度级联的 `configure-fusion` 入口可从已有训练计划派生两种配置。`encoder` 在每级 encoder 和 bottleneck 融合点图与带状图，融合结果送入下一级和 decoder。`encoder-axial` 从第三级起额外使用轴向越界距离图。它在两端之间为 0，超过任一端后随轴向距离线性增加，到指定尺度时饱和为 1。
+
+对同一数据集使用 `--fusion encoder-axial --axial-scale-px 16 32` 可一次生成两个计划。基础计划为 `DepthCascadePlans` 时，训练入口的 `--plans` 分别选 `DepthCascadePlansEncoderAxial16px` 和 `DepthCascadePlansEncoderAxial32px`。两组继承相同的数据、随机种子和初始化配置，分别保存日志与权重。省略尺度时沿用 32 px 和原计划名 `DepthCascadePlansEncoderAxial`。
+
+有标签的验证投影会记录端点外假阳性像素数、两端各自的召回率和真实前景深度 MAE。端部召回按两点间轴向长度的首尾各 10% 统计，并计入该侧端点外的真实支架像素。
+
 ## 1. 网络结构与具体改动
 
 输入张量形状为 `[N, 4, H, W]`，通道顺序固定：

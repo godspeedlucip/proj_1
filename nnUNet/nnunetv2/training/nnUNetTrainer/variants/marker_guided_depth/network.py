@@ -5,6 +5,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from ..marker_guided.fusion import MarkerFusion
 from nnunetv2.training.nnUNetTrainer.variants.marker_guided.marker_guided_network import (
     build_marker_guided_network,
 )
@@ -95,12 +96,32 @@ class MarkerGuidedNNUNetDepthCascade(nn.Module):
 
 
 def build_joint_network(config_manager, num_input_channels: int, num_output_channels: int,
-                        enable_deep_supervision: bool = True) -> MarkerGuidedNNUNetDepthCascade:
+                        enable_deep_supervision: bool = True,
+                        fusion: MarkerFusion = MarkerFusion()) -> MarkerGuidedNNUNetDepthCascade:
     if num_output_channels != 2:
         raise ValueError("Depth cascade requires binary segmentation with two softmax logits")
     backbone = build_marker_guided_network(config_manager, num_input_channels, num_output_channels,
-                                           enable_deep_supervision)
+                                           enable_deep_supervision, fusion=fusion)
     return MarkerGuidedNNUNetDepthCascade(backbone)
+
+
+def initialize_from_legacy(network, weights, *, joint):
+    """Warm-start an expanded model from the legacy two-skip backbone or depth cascade."""
+    backbone = network.backbone
+    target = network if joint else backbone
+    if backbone.fusion.mode == "skip":
+        target.load_state_dict(weights, strict=True)
+        return
+    prefix = "backbone." if joint else ""
+    added = [prefix + "axial_projections."]
+    for level in backbone.fusion_stage_indices[2:]:
+        added.extend((prefix + f"adapters.{level}.", prefix + f"prior_encoder.projections.{level}."))
+    # Only fill the new modules. Strict loading still audits every legacy parameter
+    # and executes the existing depth refiner migration for older smoke checkpoints.
+    initial = {key: value for key, value in target.state_dict().items() if key.startswith(tuple(added))}
+    if initial.keys() & weights.keys():
+        raise ValueError("Warm start expects a legacy two-skip checkpoint; use resume for a trained variant")
+    target.load_state_dict({**initial, **weights}, strict=True)
 
 
 def _segmentation_loss(logits_ds, mask: Tensor, valid_pixels: Tensor) -> Tensor:

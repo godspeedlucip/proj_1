@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 import tifffile
 
-from phase_2.tools.marker_guided.build_prior_channels import PriorConfig, build_e5u_dataset, build_marker_channels
-from phase_2.tools.marker_guided.validate_dataset import DatasetValidationError, validate_prediction_package
+from tools.marker_guided.build_prior_channels import PriorConfig, build_e5u_dataset, build_marker_channels
+from tools.marker_guided.validate_dataset import DatasetValidationError, validate_prediction_package
 
 
 def test_prior_gaussian_subpixel_endpoint_and_swap_invariance():

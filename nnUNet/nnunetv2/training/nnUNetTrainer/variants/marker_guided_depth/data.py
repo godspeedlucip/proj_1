@@ -9,7 +9,34 @@ import tifffile
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from ..marker_guided.fusion import MarkerFusion
 
+
+def usable_pair(points, shape):
+    try:
+        xy = np.asarray(points, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False
+    return (xy.shape == (2, 2) and np.isfinite(xy).all()
+            and (xy >= 0).all() and (xy < (shape[1], shape[0])).all()
+            and np.linalg.norm(xy[1] - xy[0]) >= 1.0)
+
+
+def centered_axial_coordinate(points, shape):
+    """Signed coordinate along the marker axis, measured from the midpoint in pixels."""
+    first, last = np.asarray(points, dtype=np.float64)
+    delta = last - first
+    length = np.linalg.norm(delta)
+    ux, uy = delta / length
+    cx, cy = (first + last) / 2
+    yy, xx = np.ogrid[:shape[0], :shape[1]]
+    return (xx - cx) * ux + (yy - cy) * uy, length
+
+
+def axial_distance_map(points, shape, scale_px):
+    """Unsigned projected distance beyond either endpoint, in native detector pixels."""
+    along, length = centered_axial_coordinate(points, shape)
+    return np.clip((np.abs(along) - length / 2) / scale_px, 0, 1).astype(np.float32)
 
 def prior_key(points, shape):
     key = json.dumps([list(shape), points, "marker_prior_v1_oracle_r0"], sort_keys=True)
@@ -40,17 +67,19 @@ def _read_prior(file):
         return maps["point"], maps["band"]
 
 
-def prepare_image(image, points, marker_enabled, cache_dir=None):
+def prepare_image(image, points, marker_enabled, cache_dir=None, fusion=MarkerFusion()):
     image = np.asarray(image, dtype=np.float32)
     if image.ndim != 2 or min(image.shape) == 0 or not np.isfinite(image).all():
         raise ValueError("Expected one finite 2D detector image")
     height, width = image.shape
-    channels = np.zeros((4, height, width), dtype=np.float32)
+    channels = np.zeros((fusion.channels, height, width), dtype=np.float32)
     channels[0] = (image - image.mean(dtype=np.float64)) / max(image.std(dtype=np.float64), 1e-8)
-    if marker_enabled:
+    if marker_enabled and (fusion.mode == "skip" or usable_pair(points, image.shape)):
         file = cache_dir / (prior_key(points, image.shape) + ".npz") if cache_dir else None
         channels[1], channels[2] = _read_prior(file) if file and file.is_file() else oracle_prior(points, image.shape)
         channels[3].fill(1)
+        if fusion.axial:
+            channels[4] = axial_distance_map(points, image.shape, fusion.axial_scale_px)
     return channels
 
 
@@ -64,9 +93,10 @@ def pad_frame(array, *, flip_y=False, flip_x=False):
 
 
 class FullFrameDataset(Dataset):
-    def __init__(self, root, records, scale, marker_enabled, flips=None):
+    def __init__(self, root, records, scale, marker_enabled, flips=None, fusion=MarkerFusion()):
         self.root, self.records, self.scale = root, records, scale
         self.marker_enabled, self.flips = marker_enabled, flips
+        self.fusion = fusion
 
     def __len__(self):
         return len(self.records)
@@ -74,7 +104,8 @@ class FullFrameDataset(Dataset):
     def __getitem__(self, index):
         row = self.records[index]
         image = tifffile.imread(self.root / row["image"])
-        inputs = prepare_image(image, row["marker_xy"], self.marker_enabled, self.root / "prior_cache")
+        enabled = self.marker_enabled and row.get("pair_status") != "invalid"
+        inputs = prepare_image(image, row.get("marker_xy"), enabled, self.root / "prior_cache", self.fusion)
         target = tifffile.imread(self.root / row["mask"])
         depth = tifffile.imread(self.root / row["depth"])
         if target.shape != image.shape or depth.shape != image.shape or depth.dtype != np.float32:
@@ -105,7 +136,7 @@ def _train_epoch(records, seed, epoch, count):
     return [records[i] for i in indices], flips
 
 
-def make_loaders(manifest_path, seed, smoke, epoch, marker_enabled):
+def make_loaders(manifest_path, seed, smoke, epoch, marker_enabled, fusion=MarkerFusion()):
     path = Path(manifest_path)
     manifest = json.loads(path.read_text())
     train = [s for s in manifest["samples"] if s["split"] == "train"]
@@ -114,7 +145,7 @@ def make_loaders(manifest_path, seed, smoke, epoch, marker_enabled):
         val = val[:2]
     train, flips = _train_epoch(train, int(seed), int(epoch), 4 if smoke else 250)
     def loader(rows, augmentation):
-        dataset = FullFrameDataset(path.parent, rows, manifest["target_scale"], marker_enabled, augmentation)
+        dataset = FullFrameDataset(path.parent, rows, manifest["target_scale"], marker_enabled, augmentation, fusion)
         return DataLoader(dataset, batch_size=1, num_workers=2, prefetch_factor=1, pin_memory=True)
     # The iterators are created lazily: validation workers should not fork while training is running.
     def iterate(rows, augmentation):

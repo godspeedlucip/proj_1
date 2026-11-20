@@ -20,6 +20,8 @@ from nnunetv2.utilities.checkpoints import (
 )
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 
+from ..marker_guided.fusion import MarkerFusion
+
 
 def file_sha256(path):
     digest = hashlib.sha256()
@@ -87,6 +89,7 @@ class nnUNetTrainerMarkerGuidedDepth(nnUNetTrainer):
         if self.is_ddp or self.configuration_manager.batch_size != 1:
             raise ValueError("The full-detector depth plans use a single process and batch size 1")
         self.joint = plans["joint_depth"]
+        self.fusion = MarkerFusion(**self.joint.get("marker_fusion", {}))
         self.seed = int(self.joint["seed"])
         self.target_scale = float(self.joint["target_scale"])
         if not math.isfinite(self.target_scale) or self.target_scale <= 0:
@@ -105,8 +108,9 @@ class nnUNetTrainerMarkerGuidedDepth(nnUNetTrainer):
     def build_network_architecture(plans_manager, configuration_manager, num_input_channels,
                                    num_output_channels, enable_deep_supervision=True):
         from .network import build_joint_network
+        fusion = MarkerFusion(**plans_manager.plans["joint_depth"].get("marker_fusion", {}))
         return build_joint_network(configuration_manager, num_input_channels, num_output_channels,
-                                   enable_deep_supervision)
+                                   enable_deep_supervision, fusion)
 
     def initialize(self):
         # Native initialization assumes stock .npz/.b2nd caches. Our loader uses paired TIFFs.
@@ -118,6 +122,11 @@ class nnUNetTrainerMarkerGuidedDepth(nnUNetTrainer):
         self.batch_size = 1
         self.num_input_channels = determine_num_input_channels(
             self.plans_manager, self.configuration_manager, self.dataset_json)
+        # The fifth plane is derived from the two landmarks in the full-frame loader.
+        if self.fusion.axial:
+            if self.num_input_channels != 4:
+                raise ValueError("Expected four stored E5-U channels before adding axial distance")
+            self.num_input_channels = self.fusion.channels
         self.network = self.build_network_architecture(
             self.plans_manager, self.configuration_manager, self.num_input_channels,
             self.label_manager.num_segmentation_heads, self.enable_deep_supervision).to(self.device)
@@ -152,17 +161,25 @@ class nnUNetTrainerMarkerGuidedDepth(nnUNetTrainer):
                 "depth_input_channels": ["image*mask", "mask", "probability*mask"],
                 "preprocessing": "whole-frame image z-score; right/bottom stride padding; aligned flips",
             }
+            if "marker_fusion" in self.joint:
+                self.contract["marker_fusion"] = self.joint["marker_fusion"]
+            if self.fusion.axial:
+                self.contract["input_channels"].append("axial_distance")
         return self.contract
 
     def on_train_start(self):
         if not self.was_initialized:
             self.initialize()
         if not self.restored:
-            path = str(self.joint["init_seg_checkpoint"])
-            self.print_to_log_file(f"Loading initial E5-U backbone from {path}")
-            if "init_seg_sha256" in self.joint and file_sha256(path) != self.joint["init_seg_sha256"]:
-                raise ValueError(f"Initial E5-U checkpoint changed since preparation: {path}")
-            self.network.backbone.load_state_dict(load_network_weights(path, "cpu"), strict=True)
+            from .network import initialize_from_legacy
+            joint = "init_joint_checkpoint" in self.joint
+            source = "init_joint" if joint else "init_seg"
+            path = str(self.joint[source + "_checkpoint"])
+            self.print_to_log_file(f"Loading {source} weights from {path}")
+            digest = self.joint.get(source + "_sha256")
+            if digest is not None and file_sha256(path) != digest:
+                raise ValueError(f"Initial checkpoint changed since preparation: {path}")
+            initialize_from_legacy(self.network, load_network_weights(path, "cpu"), joint=joint)
         self.set_deep_supervision_enabled(True)
         self._contract()
         model_dir = Path(self.output_folder_base)
@@ -181,7 +198,7 @@ class nnUNetTrainerMarkerGuidedDepth(nnUNetTrainer):
     def get_dataloaders(self):
         from .data import make_loaders
         train, val, n_val = make_loaders(self.joint["manifest"], self.seed, self.smoke,
-                                         self.current_epoch, self.marker_enabled)
+                                         self.current_epoch, self.marker_enabled, self.fusion)
         if n_val < 1:
             raise ValueError("Joint validation split is empty")
         self.num_val_iterations_per_epoch = n_val

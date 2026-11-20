@@ -6,7 +6,9 @@ from typing import Sequence
 import torch
 from dynamic_network_architectures.architectures.unet import PlainConvUNet
 from torch import nn
+from torch.nn import functional as F
 
+from .fusion import MarkerFusion
 from .marker_guided_encoder import MarkerGuidedPriorEncoder
 from .residual_prior_adapter import ResidualPriorAdapter
 
@@ -31,10 +33,12 @@ class MarkerGuidedPlainConvUNet(nn.Module):
 
     def __init__(self, input_channels: int, num_classes: int, deep_supervision: bool,
                  fusion_stage_indices: Sequence[int] | None = None, prior_channels: int = 2,
-                 gate_channel: int = 3, prior_feature_ratio: float = 0.25, **plain_conv_unet_kwargs):
+                 gate_channel: int = 3, prior_feature_ratio: float = 0.25,
+                 fusion: MarkerFusion = MarkerFusion(), **plain_conv_unet_kwargs):
         super().__init__()
-        if input_channels != 4:
-            raise ValueError("Marker-guided E5-U requires four input channels")
+        if input_channels != fusion.channels:
+            raise ValueError(f"{fusion.mode} fusion requires {fusion.channels} input channels")
+        self.fusion = fusion
         if prior_channels != 2 or gate_channel != 3:
             raise ValueError("E5-U expects prior channels 1-2 and validity gate channel 3")
         kwargs = dict(plain_conv_unet_kwargs)
@@ -54,7 +58,13 @@ class MarkerGuidedPlainConvUNet(nn.Module):
         self.encoder = image_network.encoder
         self.decoder = image_network.decoder
         self.feature_channels = features
-        self.fusion_stage_indices = list(fusion_stage_indices) if fusion_stage_indices is not None else list(range(min(2, n_stages)))
+        if fusion.mode == "skip":
+            self.fusion_stage_indices = (list(fusion_stage_indices) if fusion_stage_indices is not None
+                                         else list(range(min(2, n_stages))))
+        else:
+            self.fusion_stage_indices = list(range(n_stages))
+        if fusion.axial and n_stages < 3:
+            raise ValueError("Axial fusion requires at least three encoder stages")
         if not self.fusion_stage_indices or any(i < 0 or i >= n_stages for i in self.fusion_stage_indices):
             raise ValueError("fusion_stage_indices must select valid encoder stages")
         self.prior_encoder = MarkerGuidedPriorEncoder(prior_channels, features,
@@ -62,10 +72,16 @@ class MarkerGuidedPlainConvUNet(nn.Module):
         self.adapters = nn.ModuleDict({str(i): ResidualPriorAdapter(features[i], features[i])
                                        for i in self.fusion_stage_indices})
         self.gate_channel = gate_channel
+        self.axial_projections = nn.ModuleDict({
+            str(i): nn.Conv2d(1, features[i], kernel_size=1, bias=False)
+            for i in range(2, n_stages) if fusion.axial
+        })
 
     def forward(self, x: torch.Tensor):
-        if x.ndim != 4 or x.shape[1] != 4:
-            raise ValueError(f"expected input [N,4,H,W], got {tuple(x.shape)}")
+        if x.ndim != 4 or x.shape[1] != self.fusion.channels:
+            raise ValueError(f"expected input [N,{self.fusion.channels},H,W], got {tuple(x.shape)}")
+        if self.fusion.mode != "skip":
+            return self.decoder(self._guided_stages(x))
         skips = self.encoder(x[:, :1])
         priors = self.prior_encoder(x[:, 1:3], [tuple(skip.shape[-2:]) for skip in skips])
         gate = x[:, self.gate_channel:self.gate_channel + 1]
@@ -73,12 +89,30 @@ class MarkerGuidedPlainConvUNet(nn.Module):
             skips[index] = self.adapters[str(index)](skips[index], priors[index], gate)
         return self.decoder(skips)
 
+    def _guided_stages(self, x: torch.Tensor):
+        features = x[:, :1]
+        gate = x[:, self.gate_channel:self.gate_channel + 1]
+        encoded = self.prior_encoder.stem(x[:, 1:3])
+        skips = []
+        for index, stage in enumerate(self.encoder.stages):
+            features = stage(features)
+            size = features.shape[-2:]
+            key = str(index)
+            prior = self.prior_encoder.project_level(encoded, index, size)
+            if key in self.axial_projections:
+                axial = F.adaptive_avg_pool2d(x[:, 4:5], size)
+                prior = prior + self.axial_projections[key](axial)
+            features = self.adapters[key](features, prior, gate)
+            skips.append(features)
+        return skips
+
     def set_deep_supervision_enabled(self, enabled: bool):
         self.decoder.deep_supervision = enabled
 
 
 def build_marker_guided_network(configuration_manager, num_input_channels: int,
-                                num_output_channels: int, enable_deep_supervision: bool = True):
+                                num_output_channels: int, enable_deep_supervision: bool = True,
+                                fusion: MarkerFusion = MarkerFusion()):
     if configuration_manager.network_arch_class_name.split(".")[-1] != "PlainConvUNet":
         raise RuntimeError("Marker-guided Trainer supports only 2D PlainConvUNet plans")
     kwargs = _resolve_architecture_kwargs(configuration_manager)
@@ -88,9 +122,12 @@ def build_marker_guided_network(configuration_manager, num_input_channels: int,
         input_channels=num_input_channels,
         num_classes=num_output_channels,
         deep_supervision=enable_deep_supervision,
+        fusion=fusion,
         **kwargs,
     )
     network.apply(PlainConvUNet.initialize)
+    for projection in network.axial_projections.values():
+        nn.init.zeros_(projection.weight)
     for adapter in network.adapters.values():
         nn.init.zeros_(adapter.attention[-1].weight)
         nn.init.zeros_(adapter.attention[-1].bias)

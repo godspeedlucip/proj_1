@@ -1,6 +1,5 @@
 """Local entry for the native Dataset504 marker/depth Trainer and paired prediction."""
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -88,9 +87,39 @@ def bootstrap():
           flush=True)
 
 
-def setup(device):
+def configure_fusion(args):
+    """Derive comparable fusion plans from one prepared dataset and initialization."""
+    from dataclasses import asdict
+    from nnunetv2.training.nnUNetTrainer.variants.marker_guided.fusion import MarkerFusion
+    root = args.dataset_root.resolve()
+    folder = root / "preprocessed" / root.name
+    source = folder / (args.base_plans + ".json")
+    plans = json.loads(source.read_text())
+    joint = plans["joint_depth"]
+    if plans["dataset_name"] != root.name or joint.get("marker_fusion"):
+        raise ValueError("Choose the original four-channel joint depth plans for this dataset")
+    scales = args.axial_scale_px or [MarkerFusion().axial_scale_px]
+    variants = [MarkerFusion(args.fusion, scale) for scale in dict.fromkeys(scales)]
+    if len(variants) > 1 and args.fusion != "encoder-axial":
+        raise ValueError("Comparing axial scales requires encoder-axial fusion")
+    if args.init_joint is not None:
+        checkpoint = args.init_joint.resolve(strict=True)
+        joint.update(init_joint_checkpoint=str(checkpoint), init_joint_sha256=sha256(checkpoint))
+    for fusion in variants:
+        suffix = "EncoderAxial" if fusion.axial else "Encoder"
+        if fusion.axial and args.axial_scale_px is not None:
+            # Float's round-trip representation keeps distinct fractional scales distinct.
+            suffix += str(fusion.axial_scale_px).removesuffix(".0") + "px"
+        name = args.base_plans + suffix
+        variant = dict(plans, plans_name=name, joint_depth=dict(joint, marker_fusion=asdict(fusion)))
+        destination = folder / (name + ".json")
+        write_config(destination, variant)
+        print(destination, flush=True)
+
+
+def setup(device, root=ROOT):
     for var, folder in (("nnUNet_raw", "raw"), ("nnUNet_preprocessed", "preprocessed"), ("nnUNet_results", "results")):
-        os.environ[var] = str(ROOT / folder)
+        os.environ[var] = str(root / folder)
     os.environ["nnUNet_compile"] = "false"
     os.environ["OMP_NUM_THREADS"] = "2"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -113,10 +142,17 @@ def setup(device):
 
 
 def train(args):
+    import fcntl
+    root = args.dataset_root.resolve()
+    dataset, plans = root.name, args.plans
+    if not (root / "preprocessed" / dataset / (plans + ".json")).is_file():
+        raise FileNotFoundError(f"Missing prepared plans {plans} for {dataset}")
     trainer = BASE + ("NoMarker" if args.marker == "off" else "") + ("Smoke" if args.smoke else "")
-    folder = ROOT / "results" / DATASET / (trainer + "__" + PLANS + "__2d") / "fold_0"
-    logs = ROOT / "logs"
-    logs.mkdir(exist_ok=True)
+    folder = root / "results" / dataset / (trainer + "__" + plans + "__2d") / "fold_0"
+    logs = root / "logs"
+    if plans != PLANS:
+        logs = logs / plans
+    logs.mkdir(parents=True, exist_ok=True)
     if args.background:
         command = [sys.executable, "-u", str(Path(__file__).resolve()), *(v for v in sys.argv[1:] if v != "--background")]
         with (logs / (trainer + ".log")).open("ab") as output:
@@ -134,10 +170,10 @@ def train(args):
                 raise RuntimeError("Resume requires an existing latest or final checkpoint")
         elif any(folder.glob("checkpoint_*.safetensors")):
             raise RuntimeError(f"Existing checkpoints at {folder}. Use --resume.")
-        device = setup(args.device)
+        device = setup(args.device, root)
         (logs / (trainer + ".pid")).write_text(str(os.getpid()) + "\n")
         from nnunetv2.run.run_training import run_training
-        run_training(DATASET, "2d", 0, trainer_class_name=trainer, plans_identifier=PLANS,
+        run_training(dataset, "2d", 0, trainer_class_name=trainer, plans_identifier=plans,
                      continue_training=args.resume, val_with_best=True, device=device)
 
 
@@ -166,7 +202,17 @@ def main():
     cli = argparse.ArgumentParser(description=__doc__)
     sub = cli.add_subparsers(dest="command", required=True)
     sub.add_parser("prepare")
+    variant = sub.add_parser("configure-fusion", help="Derive all-stage encoder plans for a prepared dataset")
+    variant.add_argument("--dataset-root", type=Path, default=ROOT)
+    variant.add_argument("--base-plans", default=PLANS)
+    variant.add_argument("--fusion", choices=["encoder", "encoder-axial"], required=True)
+    variant.add_argument("--axial-scale-px", type=float, nargs="+", metavar="PX",
+                         help="Write a separate encoder-axial plan for each scale (e.g. 16 32). "
+                              "Omit to use the original 32 px EncoderAxial plan name.")
+    variant.add_argument("--init-joint", type=Path, help="Warm-start backbone and depth head from a legacy joint checkpoint")
     tr = sub.add_parser("train")
+    tr.add_argument("--dataset-root", type=Path, default=ROOT)
+    tr.add_argument("--plans", default=PLANS)
     tr.add_argument("--device", required=True)
     tr.add_argument("--marker", choices=["on", "off"], default="on")
     tr.add_argument("--smoke", action="store_true")
@@ -182,10 +228,13 @@ def main():
     group.add_argument("--no-marker", action="store_true")
     args = cli.parse_args()
     if args.command == "prepare":
+        import fcntl
         setup(None)
         with (ROOT / "manifest.json").open("rb") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             bootstrap()
+    elif args.command == "configure-fusion":
+        configure_fusion(args)
     elif args.command == "train":
         train(args)
     else:

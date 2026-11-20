@@ -6,12 +6,13 @@ import numpy as np
 import tifffile
 import torch
 
-from .data import pad_frame, prepare_image
+from .data import centered_axial_coordinate, pad_frame, prepare_image, usable_pair
+from ..marker_guided.fusion import MarkerFusion
 
 
 @torch.inference_mode()
 def predict_frame(network, image, points, marker_enabled, scale, device, cache_dir=None):
-    channels = prepare_image(image, points, marker_enabled, cache_dir)
+    channels = prepare_image(image, points, marker_enabled, cache_dir, network.backbone.fusion)
     x = pad_frame(channels).unsqueeze(0).to(device)
     with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
         result = network(x, return_depth=True)
@@ -37,14 +38,23 @@ def save_frame(folder, name, values, save_probabilities):
         tifffile.imwrite(dest, plane, compression="zlib", compressionargs={"level": 1})
 
 
-def frame_metrics(values, target):
+def frame_metrics(values, target, points=None):
     truth = target > 0
     pred = values["masks"] != 0
     intersection = np.count_nonzero(pred & truth)
     n, k = int(truth.sum()), int(pred.sum())
-    return {"dice": 2 * intersection / (n + k) if n + k else 1.,
-            "foreground_mae_raw": float(np.abs(values["depth_raw"][truth] - target[truth]).mean()) if n else None,
-            "predicted_foreground": k, "missed_foreground": n - intersection}
+    metrics = {"dice": 2 * intersection / (n + k) if n + k else 1.,
+               "foreground_mae_raw": float(np.abs(values["depth_raw"][truth] - target[truth]).mean()) if n else None,
+               "predicted_foreground": k, "missed_foreground": n - intersection}
+    if usable_pair(points, truth.shape):
+        along, length = centered_axial_coordinate(points, truth.shape)
+        outside = np.abs(along) > length / 2 + 1e-8
+        metrics["axial_outside_fp_pixels"] = int((outside & pred & ~truth).sum())
+        # Include true struts beyond the markers in their respective end regions.
+        for name, region in (("first", along <= -0.4 * length), ("second", along >= 0.4 * length)):
+            end = region & truth
+            metrics[f"{name}_end_recall"] = float(pred[end].mean()) if end.any() else None
+    return metrics
 
 
 def export_fold(trainer, save_probabilities=False):
@@ -62,15 +72,18 @@ def export_fold(trainer, save_probabilities=False):
     for row in rows:
         image = tifffile.imread(path.parent / row["image"])
         depth = tifffile.imread(path.parent / row["depth"])
-        args = (trainer.network, image, row["marker_xy"])
+        args = (trainer.network, image, row.get("marker_xy"))
         options = (manifest["target_scale"], trainer.device, path.parent / "prior_cache")
-        pred = predict_frame(*args, trainer.marker_enabled, *options)
+        enabled = trainer.marker_enabled and row.get("pair_status") != "invalid"
+        pred = predict_frame(*args, enabled, *options)
         save_frame(output, row["sample_id"], pred, save_probabilities)
-        item = {k: row[k] for k in ("sample_id", "image", "case_id", "group_id", "view_id", "angle_deg", "marker_xy")}
-        item.update(frame_metrics(pred, depth))
+        item = {k: row[k] for k in ("sample_id", "image", "case_id", "group_id", "view_id", "angle_deg")}
+        item["marker_xy"] = row.get("marker_xy")
+        points = row.get("marker_xy") if row.get("pair_status") != "invalid" else None
+        item.update(frame_metrics(pred, depth, points))
         if trainer.marker_enabled:
             without = predict_frame(*args, False, *options)
-            item["same_checkpoint_marker_off"] = frame_metrics(without, depth)
+            item["same_checkpoint_marker_off"] = frame_metrics(without, depth, points)
         summaries.append(item)
     metadata = {"trainer": type(trainer).__name__, "marker_enabled": trainer.marker_enabled,
                 "marker_source": manifest["marker_source"], "threshold": 0.5, "scale": manifest["target_scale"],
@@ -87,7 +100,10 @@ def restore_network(model_folder, checkpoint_path, device):
     from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
     from .network import build_joint_network
     plans = json.loads((model_folder / "plans.json").read_text())
-    network = build_joint_network(PlansManager(plans).get_configuration("2d"), 4, 2, False)
+    fusion = MarkerFusion(**plans["joint_depth"].get("marker_fusion", {}))
+    network = build_joint_network(PlansManager(plans).get_configuration("2d"), fusion.channels, 2, False, fusion)
     checkpoint = load_checkpoint_file(str(checkpoint_path), map_location="cpu")
+    if checkpoint.get("joint_depth", {}).get("marker_fusion") != plans["joint_depth"].get("marker_fusion"):
+        raise ValueError("Checkpoint and plans disagree on marker fusion")
     network.load_state_dict(checkpoint["network_weights"], strict=True)
     return network.to(device).eval(), plans["joint_depth"]
